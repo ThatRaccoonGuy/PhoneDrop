@@ -580,11 +580,32 @@ class Handler(BaseHTTPRequestHandler):
         p = self.state.resolve(name)
         if not p:
             return self.error(404, "Not found")
-        with open(p, "rb") as f:
-            r = subprocess.run(["wl-copy", "--type", MIME[p.suffix[1:].lower()]], stdin=f,
-                               capture_output=True, timeout=10)
+        # Most apps only accept image/png when pasting, so convert everything else to PNG first.
+        src, mime, png = p, MIME[p.suffix[1:].lower()], None
+        if mime != "image/png":
+            png = self.state.partial / f"{secrets.token_hex(8)}.png"
+            for cmd in (["magick", f"{p}[0]", "-auto-orient", f"png:{png}"],
+                        ["vips", "autorot", str(p), str(png)]):
+                if shutil.which(cmd[0]):
+                    try:
+                        if subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0 and png.exists():
+                            src, mime = png, "image/png"
+                            break
+                    except subprocess.TimeoutExpired:
+                        pass
+        try:
+            with open(src, "rb") as f:
+                # wl-copy forks a background process that owns the clipboard. Its output must not be
+                # piped to us, or run() would wait for that background process to exit.
+                r = subprocess.run(["wl-copy", "--type", mime], stdin=f, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=30)
+        except subprocess.TimeoutExpired:
+            return self.error(500, "wl-copy timed out")
+        finally:
+            if png:
+                png.unlink(missing_ok=True)
         if r.returncode:
-            return self.error(500, "wl-copy failed: " + r.stderr.decode(errors="replace")[:200])
+            return self.error(500, "wl-copy failed")
         self.send_json({"ok": True})
 
     def do_open_folder(self):
