@@ -28,7 +28,17 @@
     <p class="hint" id="hint">Pick photos from your phone. They appear on the computer instantly.</p>
   </section>
 
+  <section class="compose">
+    <textarea id="noteText" rows="1" placeholder="Paste a link or text to send it…" maxlength="20000"></textarea>
+    <button id="noteSend" class="primary">Send</button>
+  </section>
+
   <section id="queue" class="queue" hidden></section>
+
+  <section id="notesSection" hidden>
+    <div class="section-head"><h2>Text &amp; links <span id="noteCount" class="muted"></span></h2></div>
+    <div id="notes" class="notes"></div>
+  </section>
 
   <section>
     <div class="section-head">

@@ -55,6 +55,8 @@ STATIC_FILES = {
 }
 CLIP_KEEP = 30  # PNG clipboard copies kept for this many most-recently-used images
 THUMB_SIZES = (480, 1600)  # grid, and the viewer for formats browsers can't display (HEIC/TIFF)
+NOTE_MAX_CHARS = 20000
+NOTE_KEEP = 200
 GENERIC_STEMS = {"image", "photo", "img", "file", "blob", "picture", "upload"}
 
 PAGE_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
@@ -138,6 +140,13 @@ class State:
         self.thumb_slots = threading.BoundedSemaphore(2)  # cap concurrent decoders
         self.max_bytes = max_bytes
         self.clipper = None
+        self.notes_file = store / ".notes.json"
+        self.notes_tick = 0
+        try:
+            self.notes = [n for n in json.loads(self.notes_file.read_text())
+                          if isinstance(n, dict) and isinstance(n.get("text"), str)]
+        except (OSError, ValueError):
+            self.notes = []
         self.lock = threading.Lock()
         self.fails = {}  # ip -> [count, first_ts]
         CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -231,7 +240,33 @@ class State:
 
     def version(self) -> str:
         tick = self.clipper.tick if self.clipper else 0
-        return f"{self.store.stat().st_mtime_ns}.{tick}"
+        return f"{self.store.stat().st_mtime_ns}.{tick}.{self.notes_tick}"
+
+    # ---- notes (text and links shared between devices)
+
+    def add_note(self, text: str) -> dict:
+        note = {"id": secrets.token_urlsafe(8), "text": text, "time": time.time()}
+        with self.lock:
+            self.notes.append(note)
+            del self.notes[:-NOTE_KEEP]
+            self._save_notes()
+        return note
+
+    def find_note(self, nid: str):
+        return next((n for n in self.notes if n["id"] == nid), None)
+
+    def delete_note(self, nid: str) -> bool:
+        with self.lock:
+            before = len(self.notes)
+            self.notes = [n for n in self.notes if n["id"] != nid]
+            if len(self.notes) == before:
+                return False
+            self._save_notes()
+        return True
+
+    def _save_notes(self):
+        self._write_private(self.notes_file, json.dumps(self.notes))
+        self.notes_tick += 1
 
     def resolve(self, name: str):
         """Map a client-supplied file name to a path inside the store, or None."""
@@ -547,6 +582,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_common(200, ctype, len(data), {"Cache-Control": cache})
         self.wfile.write(data)
 
+    def read_json(self, limit=256 * 1024):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > limit:
+            return None
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return None
+
     def cookie(self, name):
         for part in self.headers.get("Cookie", "").split(";"):
             k, _, v = part.strip().partition("=")
@@ -610,6 +657,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/info":
                 return self.send_json({"local": self.is_local, "maxBytes": self.state.max_bytes,
                                        "serverCopy": self.is_local and self.state.clipper is not None,
+                                       "textCopy": self.is_local and bool(shutil.which("wl-copy")),
                                        "folder": str(self.state.store) if self.is_local else None})
             if path == "/api/files":
                 return self.do_list(query.get("wait", [None])[0])
@@ -626,6 +674,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_copy(name)
             if path.startswith("/api/prepare/"):
                 return self.do_prepare(name)
+            if path == "/api/notes":
+                return self.do_add_note()
+            if path.startswith("/api/notes/") and path.endswith("/copy"):
+                return self.do_copy_note(path[len("/api/notes/"):-len("/copy")])
             if path == "/api/open-folder":
                 return self.do_open_folder()
             if path == "/api/logout":
@@ -634,6 +686,10 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "DELETE":
             if path.startswith("/api/files/"):
                 return self.do_delete(name)
+            if path.startswith("/api/notes/"):
+                if not self.state.delete_note(name):
+                    return self.error(404, "Not found")
+                return self.send_json({"ok": True})
         self.error(404, "Not found", close=method != "GET")
 
     def do_GET(self):
@@ -670,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
             deadline = time.time() + LONG_POLL_SECONDS
             while st.version() == wait and time.time() < deadline:
                 time.sleep(0.4)
-        self.send_json({"version": st.version(), "files": st.listing()})
+        self.send_json({"version": st.version(), "files": st.listing(), "notes": list(reversed(st.notes))})
 
     def do_file(self, name, download):
         p = self.state.resolve(name)
@@ -813,6 +869,32 @@ class Handler(BaseHTTPRequestHandler):
         clipper.failed.discard(clipper.path(p).name)
         if not clipper.ready_source(p):
             clipper.request(p.name, front=True)
+        self.send_json({"ok": True})
+
+    def do_add_note(self):
+        body = self.read_json()
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return self.error(400, "Nothing to send")
+        if len(text) > NOTE_MAX_CHARS:
+            return self.error(413, f"Text too long (max {NOTE_MAX_CHARS} characters)")
+        note = self.state.add_note(text.replace("\r\n", "\n").strip())
+        self.log_message("received text (%d chars)", len(note["text"]))
+        self.send_json(note, 201)
+
+    def do_copy_note(self, nid):
+        if not self.is_local or not shutil.which("wl-copy"):
+            return self.error(403, "Server-side copy is only available on this computer")
+        note = self.state.find_note(nid)
+        if not note:
+            return self.error(404, "Not found")
+        try:
+            r = subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=note["text"].encode(),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except subprocess.TimeoutExpired:
+            return self.error(500, "wl-copy timed out")
+        if r.returncode:
+            return self.error(500, "wl-copy failed")
         self.send_json({"ok": True})
 
     def do_open_folder(self):

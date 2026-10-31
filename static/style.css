@@ -44,6 +44,21 @@ h2 { font-size: 16px; margin: 0; }
 .drop { border: 2px dashed var(--line); border-radius: var(--r); padding: 28px 16px; text-align: center; background: var(--panel); }
 .hint { color: var(--muted); margin: 12px 0 0; }
 
+.compose { display: flex; gap: 8px; margin-top: 12px; align-items: flex-end; }
+.compose textarea { flex: 1; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 9px 12px; resize: none; min-height: 40px; max-height: 160px; line-height: 1.35; }
+.compose textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.compose button { min-height: 40px; }
+
+.notes { display: grid; gap: 8px; }
+.note { display: grid; grid-template-columns: 1fr auto; gap: 8px 10px; align-items: start; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; animation: pop .25s ease-out; }
+.note-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; max-height: 9.5em; overflow: auto; }
+.note-text a { color: var(--accent); }
+.note-sub { grid-column: 1 / -1; font-size: 12px; }
+.note .row { display: flex; gap: 6px; }
+.note .row > * { padding: 6px 10px; font-size: 14px; min-height: 34px; }
+
 .queue { margin-top: 14px; display: grid; gap: 8px; }
 .qrow { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
 .qtop { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; margin-bottom: 6px; }

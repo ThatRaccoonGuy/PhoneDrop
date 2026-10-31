@@ -19,6 +19,9 @@ python3 phonedrop.py
    background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
    **Download all** gives a zip. You can also drag-and-drop or Ctrl+V images into the PC
    panel to get them onto your phone.
+5. **Text and links** work the same way: paste a link or some text into the box on either device
+   and it shows up on the other one with **Copy** and **Open** buttons. On the computer, pressing
+   Ctrl+V anywhere on the page sends whatever text is on the clipboard.
 
 If you run a firewall, allow the phone port from your local network only. For example, with UFW
 (replace `192.168.0.0/24` with your network's range):

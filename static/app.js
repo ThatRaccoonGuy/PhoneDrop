@@ -5,8 +5,9 @@ const CSRF = { 'X-PhoneDrop': '1' };
 const CONCURRENCY = 2;
 const RETRIES = 2;
 
-let info = { maxBytes: Infinity, serverCopy: false, local: false };
+let info = { maxBytes: Infinity, serverCopy: false, textCopy: false, local: false };
 let files = [];
+let notes = [];
 let version = '';
 let viewerIndex = -1;
 
@@ -254,6 +255,82 @@ async function remove(f) {
   } catch (e) { toast(e.message, true); }
 }
 
+// ---------------------------------------------------------------- notes (text & links)
+
+const URL_RE = /https?:\/\/[^\s<>"']+/g;
+const noteEls = new Map();
+
+// Turn URLs in the text into links. Only http(s) URLs match, so no javascript: links can sneak in.
+function linkify(text) {
+  const frag = document.createDocumentFragment();
+  let last = 0;
+  for (const m of text.matchAll(URL_RE)) {
+    frag.append(text.slice(last, m.index));
+    const url = m[0].replace(/[.,;:!?)]+$/, '');
+    frag.append(el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url));
+    frag.append(m[0].slice(url.length));
+    last = m.index + m[0].length;
+  }
+  frag.append(text.slice(last));
+  return frag;
+}
+
+const firstUrl = (text) => (text.match(URL_RE) || [null])[0];
+
+function renderNotes(list) {
+  notes = list;
+  const box = $('#notes');
+  const ids = new Set(list.map((n) => n.id));
+  for (const [id, row] of noteEls) if (!ids.has(id)) { row.remove(); noteEls.delete(id); }
+  list.forEach((n, i) => {
+    let row = noteEls.get(n.id);
+    if (!row) { row = makeNote(n); noteEls.set(n.id, row); }
+    row.querySelector('.note-sub').textContent = ago(n.time);
+    if (box.children[i] !== row) box.insertBefore(row, box.children[i] || null);
+  });
+  $('#notesSection').hidden = !list.length;
+  $('#noteCount').textContent = list.length ? `(${list.length})` : '';
+}
+
+function makeNote(n) {
+  const url = firstUrl(n.text);
+  const actions = el('div', { class: 'row' },
+    el('button', { onclick: () => copyNote(n) }, 'Copy'));
+  if (url) actions.append(el('a', { class: 'btn', href: url, target: '_blank', rel: 'noopener noreferrer' }, 'Open'));
+  actions.append(el('button', { class: 'danger icon', 'aria-label': 'Delete', onclick: () => removeNote(n) }, '🗑'));
+  return el('div', { class: 'note' },
+    el('div', { class: 'note-text' }, linkify(n.text)),
+    actions,
+    el('span', { class: 'note-sub muted' }));
+}
+
+async function sendNote(text) {
+  text = (text || '').trim();
+  if (!text) return;
+  try {
+    await api('/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    toast('Sent');
+  } catch (e) { toast(e.message, true); }
+}
+
+async function copyNote(n) {
+  try {
+    if (info.textCopy) {
+      await api(`/api/notes/${enc(n.id)}/copy`, { method: 'POST' });
+    } else {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard not supported in this browser');
+      await navigator.clipboard.writeText(n.text);
+    }
+    toast('Copied to clipboard');
+  } catch (e) { toast(`Copy failed: ${e.message}`, true); }
+}
+
+async function removeNote(n) {
+  try {
+    await api(`/api/notes/${enc(n.id)}`, { method: 'DELETE' });
+  } catch (e) { toast(e.message, true); }
+}
+
 // ---------------------------------------------------------------- clipboard
 
 async function toPng(blob) {
@@ -331,7 +408,7 @@ async function sync() {
       const r = await api(`/api/files?wait=${enc(version)}`);
       const d = await r.json();
       setOnline(true);
-      if (d.version !== version) { version = d.version; render(d.files); }
+      if (d.version !== version) { version = d.version; render(d.files); renderNotes(d.notes || []); }
     } catch (e) {
       setOnline(false);
       await sleep(2500);
@@ -348,7 +425,7 @@ async function init() {
   } catch {}
   if (files.length) render(files); // re-apply now that we know whether this is the computer
   if (info.local) {
-    $('#hint').textContent = 'Drop images here, paste with Ctrl+V, or send them from your phone.';
+    $('#hint').textContent = 'Drop images here, paste images or text with Ctrl+V, or send them from your phone.';
     if (info.folder) {
       const b = $('#openFolder');
       b.hidden = false;
@@ -361,9 +438,23 @@ async function init() {
   $('#pick').onclick = () => picker.click();
   picker.onchange = () => { enqueue(picker.files); picker.value = ''; };
 
+  const noteText = $('#noteText');
+  const autosize = () => { noteText.style.height = 'auto'; noteText.style.height = `${Math.min(noteText.scrollHeight, 160)}px`; };
+  noteText.addEventListener('input', autosize);
+  const submitNote = async () => { await sendNote(noteText.value); noteText.value = ''; autosize(); };
+  $('#noteSend').onclick = submitNote;
+  noteText.addEventListener('keydown', (e) => {
+    // Enter sends on a keyboard; Shift+Enter makes a new line. Phones use the Send button.
+    if (e.key === 'Enter' && !e.shiftKey && info.local) { e.preventDefault(); submitNote(); }
+  });
+
   document.addEventListener('paste', (e) => {
     const list = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
-    if (list.length) { e.preventDefault(); enqueue(list); }
+    if (list.length) { e.preventDefault(); return enqueue(list); }
+    // Pasting text anywhere outside the text box sends it straight to the other device.
+    const inField = /^(TEXTAREA|INPUT)$/.test(e.target?.tagName);
+    const text = e.clipboardData?.getData('text/plain');
+    if (!inField && text?.trim()) { e.preventDefault(); sendNote(text); }
   });
 
   let depth = 0;
