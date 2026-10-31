@@ -1,10 +1,13 @@
 # PhoneDrop
 
-Send photos from your phone to this computer over Wi-Fi. No cloud, no accounts, no dependencies
-(Python 3 stdlib + `openssl`; `qrencode` and `wl-copy` optional).
+Send photos from your phone to your computer over Wi-Fi. No cloud, no accounts, no pip installs:
+just Python 3 and `openssl`. Optional extras: `qrencode` (QR code in the terminal), `vipsthumbnail` or
+ImageMagick (fast gallery previews, HEIC support), `wl-copy` (clipboard on Wayland).
 
 ```bash
-python3 ~/Projects/PhoneDrop/phonedrop.py
+git clone https://github.com/ThatRaccoonGuy/PhoneDrop.git
+cd PhoneDrop
+python3 phonedrop.py
 ```
 
 1. A QR code appears in the terminal and the panel opens in your browser.
@@ -15,7 +18,8 @@ python3 ~/Projects/PhoneDrop/phonedrop.py
    **Download all** gives a zip. You can also drag-and-drop or Ctrl+V images into the PC
    panel to get them onto your phone.
 
-Firewall (UFW is active on this machine) — allow the phone port from your LAN only:
+If you run a firewall, allow the phone port from your local network only. For example, with UFW
+(replace `192.168.0.0/24` with your network's range):
 
 ```bash
 sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
@@ -47,3 +51,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   atomically and never overwrite each other, and there are checks for size and free disk space.
 - **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer, and image files are served sandboxed.
 - Clipboard copy and "Open folder" work only from this computer.
+
+## License
+
+[MIT](LICENSE) © 2026 ThatRaccoonGuy
