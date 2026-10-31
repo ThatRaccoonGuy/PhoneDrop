@@ -23,9 +23,13 @@
 
 <main>
   <section id="drop" class="drop">
-    <input id="picker" type="file" accept="image/*" multiple hidden>
-    <button id="pick" class="primary big">Send photos</button>
-    <p class="hint" id="hint">Pick photos from your phone. They appear on the computer instantly.</p>
+    <input id="picker" type="file" accept="image/*,video/*" multiple hidden>
+    <input id="pickerAny" type="file" multiple hidden>
+    <div class="pick-row">
+      <button id="pick" class="primary big">Send photos &amp; videos</button>
+      <button id="pickAny" class="big ghost">Send files</button>
+    </div>
+    <p class="hint" id="hint">Pick photos, videos or files on your phone. They appear on the computer instantly.</p>
   </section>
 
   <section class="compose">
@@ -55,10 +59,16 @@
     <span id="viewerName" class="ellipsis"></span>
     <button id="viewerClose" class="ghost" aria-label="Close">✕</button>
   </div>
-  <div class="viewer-img"><img id="viewerImg" alt=""></div>
+  <div class="viewer-img">
+    <img id="viewerImg" alt="">
+    <video id="viewerVideo" controls playsinline hidden></video>
+    <audio id="viewerAudio" controls hidden></audio>
+    <div id="viewerFile" class="viewer-file" hidden><span class="viewer-ext"></span><span class="viewer-size muted"></span></div>
+  </div>
   <div class="viewer-actions">
     <button id="viewerPrev" class="ghost" aria-label="Previous">‹</button>
     <button id="viewerCopy">Copy</button>
+    <a id="viewerOpen" class="btn" target="_blank" rel="noopener" hidden>Open</a>
     <a id="viewerDl" class="btn" download>Download</a>
     <button id="viewerDel" class="danger">Delete</button>
     <button id="viewerNext" class="ghost" aria-label="Next">›</button>
@@ -73,6 +83,6 @@
   <button id="selCancel" class="ghost" aria-label="Cancel">✕</button>
 </div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
-<div id="dropOverlay" class="drop-overlay" hidden>Drop images to upload</div>
+<div id="dropOverlay" class="drop-overlay" hidden>Drop files to upload</div>
 </body>
 </html>

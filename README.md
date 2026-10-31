@@ -1,8 +1,9 @@
 # PhoneDrop
 
-Send photos from your phone to your computer over Wi-Fi. No cloud, no accounts, no pip installs:
+Send photos, videos and files from your phone to your computer over Wi-Fi. No cloud, no accounts, no pip installs:
 just Python 3 and `openssl`. Optional extras: `qrencode` (QR code in the terminal), `vipsthumbnail` or
-ImageMagick (fast gallery previews, HEIC support), `wl-copy` (clipboard on Wayland).
+ImageMagick (fast gallery previews, HEIC support), `ffmpeg` (video previews and video metadata
+stripping), `wl-copy` (clipboard on Wayland).
 
 ```bash
 git clone https://github.com/ThatRaccoonGuy/PhoneDrop.git
@@ -14,7 +15,8 @@ python3 phonedrop.py
 2. Within 10 minutes, scan the QR with your phone (same Wi-Fi). Accept the self-signed certificate
    warning once (compare the SHA-256 fingerprint printed in the terminal if you want to be sure).
    Paired devices stay paired for 30 days; to pair a new one later, restart PhoneDrop.
-3. Tap **Send photos**. Images show up live on the computer, saved to `~/Pictures/PhoneDrop`.
+3. Tap **Send photos & videos** (or **Send files** for PDFs, documents, archives…). They show up
+   live on the computer, saved to `~/Pictures/PhoneDrop`. Videos and audio play in the panel.
 4. On the computer: **Copy** puts the image on the clipboard as PNG (each photo is converted in the
    background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
    **Download all** gives a zip, and **Select** lets you pick several files to zip or delete together. You can also drag-and-drop or Ctrl+V images into the PC
@@ -39,7 +41,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 | `--bind` | LAN address | interface for the phone port (`0.0.0.0` = all interfaces) |
 | `--pair-minutes` | 10 | how long after startup new devices can pair (`0` = no limit) |
 | `--dir` | `~/Pictures/PhoneDrop` | where images are saved |
-| `--max-mb` | 200 | per-file size limit |
+| `--max-mb` | 2048 | per-file size limit |
 | `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
 | `--keep-metadata` | | don't strip EXIF/XMP metadata from received images |
 | `--new-token` | | unpairs every device |
@@ -59,13 +61,19 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 - **Brute-force lockout**: 8 bad pairing attempts per IP → 15-minute block.
 - **CSRF / DNS rebinding**: changes need a custom header plus a matching Origin, and requests with
   an unknown `Host` header are rejected.
-- **Upload validation**: the type is checked from the file's magic bytes (JPEG, PNG, GIF, WebP,
-  HEIC, AVIF, BMP, TIFF). SVG and other files are rejected. Names are sanitized, files are written
-  atomically and never overwrite each other, and there are checks for size and free disk space.
+- **Upload validation**: the type is checked from the file's content, not its name. Accepted:
+  images (JPEG, PNG, GIF, WebP, HEIC, AVIF, BMP, TIFF), video (MP4, MOV, WebM, MKV, 3GP), audio
+  (MP3, M4A, OGG, WAV, FLAC), PDF, archives (ZIP, 7z, gz, tar), office/e-book documents and plain
+  text. SVG, HTML, executables and anything else are rejected. Only images, audio/video and PDFs
+  are ever shown inline; every other file is served as a download, never rendered. Names are
+  sanitized, files are written atomically and never overwrite each other, and there are checks for
+  size and free disk space.
 - **Metadata stripped on arrival**: phone photos carry GPS coordinates, the phone model and serial
   numbers, and often a hidden trailer (embedded "motion photo" video, depth map). PhoneDrop removes
   all of that from JPEG, PNG and WebP files without re-encoding them (pixels stay identical, only
-  the orientation tag is kept). HEIC/AVIF/TIFF are stored as-is; the terminal log says which.
+  the orientation tag is kept). MP4/MOV videos are remuxed with `ffmpeg` to drop their location
+  and device tags (streams are copied, not re-encoded). HEIC/AVIF/TIFF/WebM/MKV are stored as-is;
+  the terminal log says which.
   Use `--keep-metadata` to turn this off.
 - **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer, and image files are served sandboxed.
 - Clipboard copy and "Open folder" work only from this computer.

@@ -67,7 +67,10 @@ function el(tag, attrs = {}, ...kids) {
   return e;
 }
 
-const previewable = (f) => !/heic|tiff/.test(f.type);
+const isImage = (f) => f.kind === 'image';
+const previewable = (f) => isImage(f) && !/heic|tiff/.test(f.type);
+const hasThumb = (f) => ['image', 'video', 'pdf'].includes(f.kind);
+const ext = (f) => f.name.split('.').pop().toUpperCase();
 
 // ---------------------------------------------------------------- uploads
 
@@ -173,7 +176,7 @@ function render(list) {
   }
   list.forEach((f, i) => {
     let card = cards.get(f.name);
-    if (!card || card.dataset.url !== f.url) {
+    if (!card || card.dataset.url !== f.url || card.dataset.kind !== f.kind) {
       const fresh = makeCard(f);
       card ? card.replaceWith(fresh) : null;
       card = fresh;
@@ -202,6 +205,7 @@ function render(list) {
 // On this computer, Copy uses a PNG the server prepares in the background. Until it's ready the
 // image shows a progress overlay and Copy is disabled, so the clipboard only ever gets the finished image.
 function clipState(f) {
+  if (!isImage(f)) return null;
   if (!info.serverCopy || !f.clip) return { label: 'Copy', disabled: false };
   switch (f.clip) {
     case 'ready': return { label: 'Copy', disabled: false };
@@ -214,6 +218,8 @@ function clipState(f) {
 
 function applyCopyButton(btn, f) {
   const s = clipState(f);
+  btn.hidden = !s;
+  if (!s) return s;
   btn.textContent = s.label;
   btn.disabled = s.disabled;
   btn.title = s.title || '';
@@ -221,9 +227,10 @@ function applyCopyButton(btn, f) {
 }
 
 function updateClip(card, f) {
+  if (!isImage(f)) return;
   const s = applyCopyButton(card.querySelector('.copy-btn'), f);
   const overlay = card.querySelector('.convert');
-  overlay.hidden = !s.busy;
+  overlay.hidden = !s?.busy;
   if (s.busy) {
     overlay.querySelector('i').style.width = `${s.pct}%`;
     overlay.querySelector('.convert-label').textContent = s.text;
@@ -231,26 +238,40 @@ function updateClip(card, f) {
 }
 
 function makeCard(f) {
-  const thumb = el('img', { src: f.thumb, alt: f.name, loading: 'lazy', decoding: 'async' });
-  thumb.addEventListener('error', () => {
-    if (previewable(f) && thumb.src.indexOf('/f/') < 0) thumb.src = f.url; // no thumbnailer: fall back to original
-    else thumb.replaceWith(el('div', { class: 'noprev' }, f.type.split('/')[1].toUpperCase()));
-  });
-  const card = el('figure', { class: 'card' },
-    el('div', { class: 'thumb-wrap' },
+  const tile = () => el('div', { class: `noprev ${f.kind}` }, ext(f));
+  let thumb = tile();
+  if (hasThumb(f)) {
+    thumb = el('img', { src: f.thumb, alt: f.name, loading: 'lazy', decoding: 'async' });
+    thumb.addEventListener('error', () => {
+      if (previewable(f) && thumb.src.indexOf('/f/') < 0) thumb.src = f.url; // no thumbnailer: fall back to original
+      else thumb.replaceWith(tile());
+    });
+  }
+  const wrap = el('div', { class: 'thumb-wrap' },
       el('button', { class: 'thumb', 'aria-label': `Open ${f.name}`,
         onclick: () => (selecting ? toggleSelect(f.name) : openViewer(f.name)) }, thumb),
-      el('span', { class: 'check' }),
-      el('div', { class: 'convert', hidden: '' },
-        el('div', { class: 'convert-bar' }, el('i')),
-        el('span', { class: 'convert-label' }))),
+      el('span', { class: 'check' }));
+  if (f.kind === 'video') wrap.append(el('span', { class: 'badge' }, '▶ video'));
+  if (isImage(f)) {
+    wrap.append(el('div', { class: 'convert', hidden: '' },
+      el('div', { class: 'convert-bar' }, el('i')),
+      el('span', { class: 'convert-label' })));
+  }
+  const primary = isImage(f)
+    ? el('button', { class: 'copy-btn', onclick: () => copyImage(byName(f.name)) }, 'Copy')
+    : f.kind === 'file'
+      ? el('span', { class: 'copy-btn', hidden: '' })
+      : el('a', { class: 'btn', href: f.url, target: '_blank', rel: 'noopener' }, 'Open');
+  const card = el('figure', { class: 'card' },
+    wrap,
     el('figcaption', {},
       el('div', { class: 'meta' }, el('span', { class: 'ellipsis' }, f.name), el('span', { class: 'meta-sub muted' })),
-      el('div', { class: 'row' },
-        el('button', { class: 'copy-btn', onclick: () => copyImage(byName(f.name)) }, 'Copy'),
+      el('div', { class: `row${f.kind === 'file' ? ' two' : ''}` },
+        primary,
         el('a', { class: 'btn', href: `/f/${enc(f.name)}?dl=1`, download: f.name }, 'Save'),
         el('button', { class: 'danger icon', 'aria-label': 'Delete', onclick: () => remove(byName(f.name)) }, '🗑'))));
   card.dataset.url = f.url;
+  card.dataset.kind = f.kind;
   return card;
 }
 
@@ -426,13 +447,35 @@ function openViewer(name) {
   if (!d.open) d.showModal();
 }
 
+function stopMedia() {
+  for (const id of ['#viewerVideo', '#viewerAudio']) {
+    const m = $(id);
+    m.pause(); m.removeAttribute('src'); m.load(); m.hidden = true;
+  }
+}
+
 function showViewer() {
   const f = files[viewerIndex];
   $('#viewerName').textContent = f.name;
-  const img = $('#viewerImg');
-  img.hidden = false;
-  img.src = previewable(f) ? f.url : `${f.thumb}&size=1600`;
+  stopMedia();
+  const img = $('#viewerImg'), file = $('#viewerFile');
+  img.hidden = true; file.hidden = true;
+  if (isImage(f)) {
+    img.hidden = false;
+    img.src = previewable(f) ? f.url : `${f.thumb}&size=1600`;
+  } else if (f.kind === 'video' || f.kind === 'audio') {
+    const m = $(f.kind === 'video' ? '#viewerVideo' : '#viewerAudio');
+    m.src = f.url; m.hidden = false;
+    m.play().catch(() => {});
+  } else {
+    file.hidden = false;
+    file.querySelector('.viewer-ext').textContent = ext(f);
+    file.querySelector('.viewer-size').textContent = human(f.size);
+  }
   applyCopyButton($('#viewerCopy'), f);
+  const open = $('#viewerOpen');
+  open.hidden = isImage(f) || f.kind === 'file';
+  open.href = f.url;
   $('#viewerDl').href = `/f/${enc(f.name)}?dl=1`;
   $('#viewerDl').setAttribute('download', f.name);
 }
@@ -474,7 +517,7 @@ async function init() {
   } catch {}
   if (files.length) render(files); // re-apply now that we know whether this is the computer
   if (info.local) {
-    $('#hint').textContent = 'Drop images here, paste images or text with Ctrl+V, or send them from your phone.';
+    $('#hint').textContent = 'Drop files here, paste images or text with Ctrl+V, or send them from your phone.';
     if (info.folder) {
       const b = $('#openFolder');
       b.hidden = false;
@@ -496,9 +539,11 @@ async function init() {
     if (e.key === 'Escape' && selecting && !$('#viewer').open) setSelecting(false);
   });
 
-  const picker = $('#picker');
-  $('#pick').onclick = () => picker.click();
-  picker.onchange = () => { enqueue(picker.files); picker.value = ''; };
+  for (const [btn, input] of [['#pick', '#picker'], ['#pickAny', '#pickerAny']]) {
+    const picker = $(input);
+    $(btn).onclick = () => picker.click();
+    picker.onchange = () => { enqueue(picker.files); picker.value = ''; };
+  }
 
   const noteText = $('#noteText');
   const autosize = () => { noteText.style.height = 'auto'; noteText.style.height = `${Math.min(noteText.scrollHeight, 160)}px`; };
@@ -511,7 +556,7 @@ async function init() {
   });
 
   document.addEventListener('paste', (e) => {
-    const list = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
+    const list = [...(e.clipboardData?.files || [])];
     if (list.length) { e.preventDefault(); return enqueue(list); }
     // Pasting text anywhere outside the text box sends it straight to the other device.
     const inField = /^(TEXTAREA|INPUT)$/.test(e.target?.tagName);
@@ -533,6 +578,7 @@ async function init() {
 
   const viewer = $('#viewer');
   $('#viewerClose').onclick = () => viewer.close();
+  viewer.addEventListener('close', stopMedia);
   $('#viewerPrev').onclick = () => step(-1);
   $('#viewerNext').onclick = () => step(1);
   $('#viewerCopy').onclick = () => copyImage(files[viewerIndex]);

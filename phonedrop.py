@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PhoneDrop — send images from your phone to this computer over the local network.
+"""PhoneDrop — send photos, videos and files from your phone to this computer over the local network.
 
 Two listeners:
   * HTTPS on the LAN (default :8443) for the phone (self-signed cert, generated on first run)
@@ -44,10 +44,31 @@ PAIR_MAX_FAILS = 8
 PAIR_FAIL_WINDOW = 15 * 60
 PAIR_MINUTES = 10
 
-MIME = {
+IMAGE_MIME = {
     "jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp",
     "heic": "image/heic", "avif": "image/avif", "bmp": "image/bmp", "tiff": "image/tiff",
 }
+VIDEO_MIME = {"mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+              "mkv": "video/x-matroska", "3gp": "video/3gpp"}
+AUDIO_MIME = {"mp3": "audio/mpeg", "m4a": "audio/mp4", "ogg": "audio/ogg", "wav": "audio/wav", "flac": "audio/flac"}
+# Everything else is only ever served as a download, never rendered by the browser.
+FILE_EXTS = {"pdf", "zip", "7z", "gz", "tar", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+             "txt", "md", "csv", "json", "log", "srt", "ics", "vcf"}
+ZIP_BASED = {"docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "zip"}
+TEXT_EXTS = {"txt", "md", "csv", "json", "log", "srt", "ics", "vcf"}
+MIME = {**IMAGE_MIME, **VIDEO_MIME, **AUDIO_MIME, "pdf": "application/pdf",
+        **{e: "application/octet-stream" for e in FILE_EXTS if e != "pdf"}}
+SNIFF_BYTES = 1024
+
+
+def kind_of(ext: str) -> str:
+    if ext in IMAGE_MIME:
+        return "image"
+    if ext in VIDEO_MIME:
+        return "video"
+    if ext in AUDIO_MIME:
+        return "audio"
+    return "pdf" if ext == "pdf" else "file"
 STATIC_FILES = {
     "app.js": "text/javascript; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
@@ -59,7 +80,7 @@ NOTE_MAX_CHARS = 20000
 NOTE_KEEP = 200
 GENERIC_STEMS = {"image", "photo", "img", "file", "blob", "picture", "upload"}
 
-PAGE_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
+PAGE_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self'; "
             "connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 FILE_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"
 
@@ -85,6 +106,79 @@ def sniff_image(head: bytes):
     if head[:4] in (b"II*\x00", b"MM\x00*"):
         return "tiff"
     return None
+
+
+def sniff_type(head: bytes, claimed_ext: str):
+    """Work out the real type of an upload from its first bytes. The extension the phone sent is
+    only trusted to tell apart formats that share a container (docx vs zip) or plain-text files."""
+    ext = sniff_image(head)
+    if ext:
+        return ext
+    if head[4:8] == b"ftyp":
+        major, brands = head[8:12], head[8:64]
+        if major == b"qt  ":
+            return "mov"
+        if major == b"M4A ":
+            return "m4a"
+        if major.startswith(b"3g"):
+            return "3gp"
+        if any(b in brands for b in (b"isom", b"iso2", b"mp41", b"mp42", b"avc1", b"M4V ", b"mp71", b"iso5", b"iso6")):
+            return "mp4"
+        return None
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm" if b"webm" in head[:64] else "mkv"
+    if head.startswith(b"ID3") or (head[0:1] == b"\xff" and head[1:2] in (b"\xfb", b"\xf3", b"\xf2", b"\xe3")):
+        return "mp3"
+    if head.startswith(b"OggS"):
+        return "ogg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head.startswith(b"fLaC"):
+        return "flac"
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"PK\x03\x04"):
+        return claimed_ext if claimed_ext in ZIP_BASED else "zip"
+    if head.startswith(b"7z\xbc\xaf\x27\x1c"):
+        return "7z"
+    if head.startswith(b"\x1f\x8b"):
+        return "gz"
+    if head[257:262] == b"ustar":
+        return "tar"
+    if claimed_ext in TEXT_EXTS and b"\0" not in head:
+        try:
+            head.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                head[:-3].decode("utf-8")  # a multi-byte character may be cut at the buffer edge
+            except UnicodeDecodeError:
+                return None
+        return claimed_ext
+    return None
+
+
+def claimed_extension(name: str) -> str:
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def strip_video(path: Path, ext: str) -> bool:
+    """Remux the video without its global metadata (GPS, device). Streams are copied, not re-encoded."""
+    if ext not in ("mp4", "m4v", "mov", "3gp") or not shutil.which("ffmpeg"):
+        return False
+    fmt = {"mov": "mov", "3gp": "3gp"}.get(ext, "mp4")
+    tmp = path.with_name(path.name + ".strip")
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-map", "0", "-map_metadata", "-1",
+                            "-c", "copy", "-movflags", "+faststart", "-f", fmt, str(tmp)],
+                           capture_output=True, timeout=600)
+        if r.returncode or not tmp.exists() or not tmp.stat().st_size:
+            tmp.unlink(missing_ok=True)
+            return False
+        os.replace(tmp, path)
+        return True
+    except subprocess.TimeoutExpired:
+        tmp.unlink(missing_ok=True)
+        return False
 
 
 # ---------------------------------------------------------------- metadata stripping
@@ -241,12 +335,13 @@ def strip_metadata(path: Path, ext: str) -> bool:
         return False
 
 
-def safe_stem(name: str) -> str:
+def safe_stem(name: str, kind: str = "image") -> str:
     name = unicodedata.normalize("NFKC", name).replace("\\", "/").rsplit("/", 1)[-1]
     stem = name.rsplit(".", 1)[0] if "." in name else name
     stem = re.sub(r"[^\w\- ()]+", "_", stem, flags=re.UNICODE).strip(" ._-")[:80]
     if not stem or stem.lower() in GENERIC_STEMS:
-        stem = time.strftime("IMG_%Y%m%d_%H%M%S")
+        prefix = {"image": "IMG", "video": "VID", "audio": "AUD"}.get(kind, "FILE")
+        stem = time.strftime(f"{prefix}_%Y%m%d_%H%M%S")
     return stem
 
 
@@ -455,11 +550,21 @@ class State:
                 return out
             tmp = self.thumbs / f".{secrets.token_hex(6)}.jpg"
             cmds = []
-            if shutil.which("vipsthumbnail"):
-                cmds.append(["vipsthumbnail", str(p), "-s", f"{size}x{size}", "-o", f"{tmp}[Q=78,strip]"])
-            if shutil.which("magick"):
-                cmds.append(["magick", f"{p}[0]", "-auto-orient", "-thumbnail", f"{size}x{size}>",
-                             "-quality", "78", "-strip", f"jpg:{tmp}"])
+            kind = kind_of(p.suffix[1:].lower())
+            if kind == "video" and shutil.which("ffmpeg"):
+                # A frame from one second in (or the first frame for very short clips).
+                for ss in ("1", "0"):
+                    cmds.append(["ffmpeg", "-v", "error", "-y", "-ss", ss, "-i", str(p), "-frames:v", "1",
+                                 "-vf", f"scale='min({size},iw)':-2", "-q:v", "4", "-f", "image2", str(tmp)])
+            elif kind == "pdf" and shutil.which("magick"):
+                cmds.append(["magick", "-density", "72", f"{p}[0]", "-background", "white", "-alpha", "remove",
+                             "-thumbnail", f"{size}x{size}>", "-quality", "78", "-strip", f"jpg:{tmp}"])
+            elif kind == "image":
+                if shutil.which("vipsthumbnail"):
+                    cmds.append(["vipsthumbnail", str(p), "-s", f"{size}x{size}", "-o", f"{tmp}[Q=78,strip]"])
+                if shutil.which("magick"):
+                    cmds.append(["magick", f"{p}[0]", "-auto-orient", "-thumbnail", f"{size}x{size}>",
+                                 "-quality", "78", "-strip", f"jpg:{tmp}"])
             try:
                 for cmd in cmds:
                     try:
@@ -500,9 +605,10 @@ class State:
                 continue
             st = p.stat()
             q = urllib.parse.quote(p.name)
-            f = {"name": p.name, "size": st.st_size, "mtime": st.st_mtime, "type": MIME[ext],
+            kind = kind_of(ext)
+            f = {"name": p.name, "size": st.st_size, "mtime": st.st_mtime, "type": MIME[ext], "kind": kind,
                  "url": f"/f/{q}?v={st.st_mtime_ns}", "thumb": f"/t/{q}?v={st.st_mtime_ns}"}
-            if self.clipper:
+            if self.clipper and kind == "image":
                 f["clip"], f["clipPct"] = self.clipper.status(p)
             files.append(f)
         files.sort(key=lambda f: f["mtime"], reverse=True)
@@ -580,7 +686,7 @@ class Clipper:
 
     def scan(self):
         """Drop PNGs of deleted/changed images, and queue the newest images that lack one."""
-        files = [self.state.resolve(f["name"]) for f in self.state.listing()]
+        files = [self.state.resolve(f["name"]) for f in self.state.listing() if f["kind"] == "image"]
         files = [p for p in files if p]
         valid = {self.path(p).name for p in files}
         for t in self.dir.glob("*.png"):
@@ -610,7 +716,7 @@ class Clipper:
                 self.bump()
             try:
                 p = self.state.resolve(name)
-                if p and not self.ready_source(p):
+                if p and kind_of(p.suffix[1:].lower()) == "image" and not self.ready_source(p):
                     out = self.path(p)
                     if self.convert(p, out):
                         self.failed.discard(out.name)
@@ -889,15 +995,43 @@ class Handler(BaseHTTPRequestHandler):
         p = self.state.resolve(name)
         if not p:
             return self.error(404, "Not found")
+        ext = p.suffix[1:].lower()
+        kind = kind_of(ext)
         size = p.stat().st_size
-        disp = "attachment" if download else "inline"
+        # Only images, audio/video and PDFs are ever shown inline; anything else is a download.
+        inline = not download and kind in ("image", "video", "audio", "pdf")
         quoted = urllib.parse.quote(p.name)
-        self.send_common(200, MIME[p.suffix[1:].lower()], size, {
-            "Content-Disposition": f"{disp}; filename*=UTF-8''{quoted}",
+        headers = {
+            "Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quoted}",
             "Cache-Control": "private, max-age=86400",
-        }, csp=FILE_CSP)
+            "Accept-Ranges": "bytes",
+        }
+        # Chrome's PDF viewer refuses to render under a CSP sandbox; it runs in its own sandbox anyway.
+        csp = "default-src 'none'" if kind == "pdf" else FILE_CSP
+        start, end = 0, size - 1
+        status = 200
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if m and size and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:  # suffix range: the last N bytes
+                start = max(0, size - int(m.group(2)))
+            if start > end or start >= size:
+                return self.send_common(416, "text/plain", 0, {"Content-Range": f"bytes */{size}"})
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        length = end - start + 1 if size else 0
+        self.send_common(status, MIME[ext] if inline else "application/octet-stream", length, headers, csp=csp)
         with open(p, "rb") as f:
-            shutil.copyfileobj(f, self.wfile, 256 * 1024)
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(256 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def do_zip(self, names=None):
         if names is not None:
@@ -944,19 +1078,23 @@ class Handler(BaseHTTPRequestHandler):
                     chunk = self.rfile.read(min(remaining, 1024 * 1024))
                     if not chunk:
                         raise ConnectionError("client disconnected")
-                    if len(head) < 64:
-                        head += chunk[:64 - len(head)]
+                    if len(head) < SNIFF_BYTES:
+                        head += chunk[:SNIFF_BYTES - len(head)]
                     out.write(chunk)
                     remaining -= len(chunk)
-            ext = sniff_image(head)
+            claimed = claimed_extension(orig)
+            ext = sniff_type(head, claimed)
             if not ext:
                 tmp.unlink(missing_ok=True)
-                return self.error(415, "That file is not a supported image")
+                return self.error(415, f"Unsupported file type{' (.' + claimed + ')' if claimed else ''}")
+            kind = kind_of(ext)
 
-            stripped = False if st.keep_metadata else strip_metadata(tmp, ext)
+            stripped = False
+            if not st.keep_metadata:
+                stripped = strip_metadata(tmp, ext) if kind == "image" else strip_video(tmp, ext) if kind == "video" else False
             if stripped:
                 length = tmp.stat().st_size
-            stem = safe_stem(orig)
+            stem = safe_stem(orig, kind)
             os.chmod(tmp, 0o644)
             for i in range(10000):
                 final = st.store / (f"{stem}.{ext}" if i == 0 else f"{stem}-{i}.{ext}")
@@ -967,10 +1105,10 @@ class Handler(BaseHTTPRequestHandler):
                     continue
             else:
                 return self.error(409, "Could not pick a file name")
-            self.log_message("received %s (%s, %s)", final.name, human(length),
-                             "metadata stripped" if stripped else "metadata kept" if st.keep_metadata
-                             else "metadata kept: can't strip ." + ext)
-            if st.clipper:
+            meta = ("metadata stripped" if stripped else "metadata kept" if st.keep_metadata
+                    else "metadata kept: can't strip ." + ext if kind in ("image", "video") else "")
+            self.log_message("received %s (%s%s)", final.name, human(length), ", " + meta if meta else "")
+            if st.clipper and kind == "image":
                 st.clipper.request(final.name)
             self.send_json({"name": final.name, "size": length}, 201)
         except (ConnectionError, TimeoutError, ssl.SSLError):
@@ -1146,13 +1284,13 @@ def print_qr(url):
 # ---------------------------------------------------------------- main
 
 def main():
-    ap = argparse.ArgumentParser(description="Receive images from your phone over the local network.")
+    ap = argparse.ArgumentParser(description="Receive photos, videos and files from your phone over the local network.")
     ap.add_argument("--port", type=int, default=8443, help="HTTPS port for the phone (default 8443)")
     ap.add_argument("--local-port", type=int, default=8080, help="localhost HTTP port for this computer (default 8080)")
     ap.add_argument("--bind", help="address for the LAN listener (default: this computer's LAN address; "
                                    "0.0.0.0 = all interfaces)")
     ap.add_argument("--dir", default=str(Path.home() / "Pictures" / "PhoneDrop"), help="where images are saved")
-    ap.add_argument("--max-mb", type=int, default=200, help="max size per file in MB (default 200)")
+    ap.add_argument("--max-mb", type=int, default=2048, help="max size per file in MB (default 2048)")
     ap.add_argument("--clip-cache", type=int, default=CLIP_KEEP,
                     help=f"keep ready-to-paste PNGs for this many recent images (default {CLIP_KEEP}, ~17 MB each)")
     ap.add_argument("--pair-minutes", type=int, default=PAIR_MINUTES,
