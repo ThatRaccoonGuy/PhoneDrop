@@ -8,6 +8,8 @@ const RETRIES = 2;
 let info = { maxBytes: Infinity, serverCopy: false, textCopy: false, local: false };
 let files = [];
 let notes = [];
+let selecting = false;
+const selected = new Set();
 let version = '';
 let viewerIndex = -1;
 
@@ -178,12 +180,17 @@ function render(list) {
       cards.set(f.name, card);
     }
     card.querySelector('.meta-sub').textContent = `${human(f.size)} · ${ago(f.mtime)}`;
+    card.classList.toggle('selected', selected.has(f.name));
     updateClip(card, f);
     if (grid.children[i] !== card) grid.insertBefore(card, grid.children[i] || null);
   });
   $('#empty').hidden = list.length > 0;
   $('#count').textContent = list.length ? `(${list.length})` : '';
   $('#zipAll').hidden = !list.length;
+  $('#selectToggle').hidden = !list.length;
+  for (const n of selected) if (!names.has(n)) selected.delete(n);
+  if (selecting && !list.length) setSelecting(false);
+  updateSelbar();
   if ($('#viewer').open) {
     const cur = $('#viewerName').textContent;
     const idx = files.findIndex((f) => f.name === cur);
@@ -231,7 +238,9 @@ function makeCard(f) {
   });
   const card = el('figure', { class: 'card' },
     el('div', { class: 'thumb-wrap' },
-      el('button', { class: 'thumb', 'aria-label': `Open ${f.name}`, onclick: () => openViewer(f.name) }, thumb),
+      el('button', { class: 'thumb', 'aria-label': `Open ${f.name}`,
+        onclick: () => (selecting ? toggleSelect(f.name) : openViewer(f.name)) }, thumb),
+      el('span', { class: 'check' }),
       el('div', { class: 'convert', hidden: '' },
         el('div', { class: 'convert-bar' }, el('i')),
         el('span', { class: 'convert-label' }))),
@@ -246,6 +255,46 @@ function makeCard(f) {
 }
 
 const byName = (n) => files.find((f) => f.name === n);
+
+// ---------------------------------------------------------------- multi-select
+
+function setSelecting(on) {
+  selecting = on;
+  if (!on) selected.clear();
+  document.body.classList.toggle('selecting', on);
+  $('#selectToggle').textContent = on ? 'Done' : 'Select';
+  for (const [name, card] of cards) card.classList.toggle('selected', selected.has(name));
+  updateSelbar();
+}
+
+function toggleSelect(name) {
+  selected.has(name) ? selected.delete(name) : selected.add(name);
+  cards.get(name)?.classList.toggle('selected', selected.has(name));
+  updateSelbar();
+}
+
+function updateSelbar() {
+  const bar = $('#selbar');
+  bar.hidden = !selecting;
+  if (!selecting) return;
+  const n = selected.size;
+  $('#selCount').textContent = `${n} selected`;
+  $('#selAll').textContent = n === files.length ? 'Select none' : 'Select all';
+  $('#selZip').classList.toggle('disabled', !n);
+  $('#selDel').disabled = !n;
+  $('#selZip').href = n ? '/api/zip?' + [...selected].map((x) => `n=${enc(x)}`).join('&') : '#';
+}
+
+async function deleteSelected() {
+  const names = [...selected];
+  if (!names.length || !confirm(`Delete ${names.length} file${names.length > 1 ? 's' : ''}?`)) return;
+  try {
+    const r = await (await api('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }) })).json();
+    toast(`Deleted ${r.deleted}`);
+    setSelecting(false);
+  } catch (e) { toast(e.message, true); }
+}
 
 async function remove(f) {
   if (!f || !confirm(`Delete ${f.name}?`)) return;
@@ -433,6 +482,19 @@ async function init() {
       b.onclick = () => api('/api/open-folder', { method: 'POST' }).catch((e) => toast(e.message, true));
     }
   }
+
+  $('#selectToggle').onclick = () => setSelecting(!selecting);
+  $('#selCancel').onclick = () => setSelecting(false);
+  $('#selAll').onclick = () => {
+    if (selected.size === files.length) selected.clear(); else files.forEach((f) => selected.add(f.name));
+    for (const [name, card] of cards) card.classList.toggle('selected', selected.has(name));
+    updateSelbar();
+  };
+  $('#selZip').onclick = (e) => { if (!selected.size) e.preventDefault(); };
+  $('#selDel').onclick = deleteSelected;
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && selecting && !$('#viewer').open) setSelecting(false);
+  });
 
   const picker = $('#picker');
   $('#pick').onclick = () => picker.click();

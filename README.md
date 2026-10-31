@@ -17,7 +17,7 @@ python3 phonedrop.py
 3. Tap **Send photos**. Images show up live on the computer, saved to `~/Pictures/PhoneDrop`.
 4. On the computer: **Copy** puts the image on the clipboard as PNG (each photo is converted in the
    background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
-   **Download all** gives a zip. You can also drag-and-drop or Ctrl+V images into the PC
+   **Download all** gives a zip, and **Select** lets you pick several files to zip or delete together. You can also drag-and-drop or Ctrl+V images into the PC
    panel to get them onto your phone.
 5. **Text and links** work the same way: paste a link or some text into the box on either device
    and it shows up on the other one with **Copy** and **Open** buttons. On the computer, pressing

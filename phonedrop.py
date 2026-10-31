@@ -817,7 +817,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/files":
                 return self.do_list(query.get("wait", [None])[0])
             if path == "/api/zip":
-                return self.do_zip()
+                return self.do_zip(query.get("n"))
             if path.startswith("/t/"):
                 return self.do_thumb(name, query.get("size", ["480"])[0])
             if path.startswith("/f/"):
@@ -831,6 +831,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_prepare(name)
             if path == "/api/notes":
                 return self.do_add_note()
+            if path == "/api/delete":
+                return self.do_bulk_delete()
             if path.startswith("/api/notes/") and path.endswith("/copy"):
                 return self.do_copy_note(path[len("/api/notes/"):-len("/copy")])
             if path == "/api/open-folder":
@@ -897,7 +899,13 @@ class Handler(BaseHTTPRequestHandler):
         with open(p, "rb") as f:
             shutil.copyfileobj(f, self.wfile, 256 * 1024)
 
-    def do_zip(self):
+    def do_zip(self, names=None):
+        if names is not None:
+            paths = [p for p in (self.state.resolve(n) for n in names[:1000]) if p]
+            if not paths:
+                return self.error(404, "No such files")
+        else:
+            paths = [p for p in (self.state.resolve(f["name"]) for f in self.state.listing()) if p]
         self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
@@ -908,9 +916,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         # Images are already compressed, so ZIP_STORED is fast and loses nothing.
         with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_STORED) as z:
-            for f in self.state.listing():
-                p = self.state.resolve(f["name"])
-                if p:
+            for p in paths:
+                if p.is_file():
                     z.write(p, p.name)
 
     def do_upload(self):
@@ -981,15 +988,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_common(200, "image/jpeg", len(data), {"Cache-Control": "private, max-age=604800"}, csp=FILE_CSP)
         self.wfile.write(data)
 
-    def do_delete(self, name):
+    def remove_file(self, name) -> bool:
         p = self.state.resolve(name)
         if not p:
-            return self.error(404, "Not found")
+            return False
         p.unlink()
         self.state.drop_thumbs(name)
         if self.state.clipper:
             self.state.clipper.forget(name)
+        return True
+
+    def do_delete(self, name):
+        if not self.remove_file(name):
+            return self.error(404, "Not found")
         self.send_json({"ok": True})
+
+    def do_bulk_delete(self):
+        body = self.read_json()
+        names = body.get("names") if isinstance(body, dict) else None
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            return self.error(400, "Expected a list of file names")
+        deleted = sum(self.remove_file(n) for n in names[:1000])
+        self.log_message("deleted %d file(s)", deleted)
+        self.send_json({"deleted": deleted})
 
     def do_copy(self, name):
         clipper = self.state.clipper

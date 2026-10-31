@@ -43,6 +43,7 @@
   <section>
     <div class="section-head">
       <h2>Received <span id="count" class="muted"></span></h2>
+      <button id="selectToggle" class="ghost" hidden>Select</button>
     </div>
     <div id="empty" class="empty" hidden>Nothing here yet.</div>
     <div id="grid" class="grid"></div>
@@ -64,6 +65,13 @@
   </div>
 </dialog>
 
+<div id="selbar" class="selbar" hidden>
+  <span id="selCount">0 selected</span>
+  <button id="selAll" class="ghost">Select all</button>
+  <a id="selZip" class="btn" href="#" download><span class="long">Download zip</span><span class="short">Zip</span></a>
+  <button id="selDel" class="danger">Delete</button>
+  <button id="selCancel" class="ghost" aria-label="Cancel">✕</button>
+</div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <div id="dropOverlay" class="drop-overlay" hidden>Drop images to upload</div>
 </body>
