@@ -6,8 +6,9 @@ Two listeners:
   * HTTP on 127.0.0.1 (default :8080) for this computer's browser (localhost is a secure
     context, so clipboard copy works without certificate warnings)
 
-Access requires pairing: scan the QR code printed in the terminal. Pairing sets a
-long-lived HttpOnly session cookie. Run with --new-token to revoke every paired device.
+Access requires pairing: scan the QR code printed in the terminal. The pairing secret is new on
+every run and only works for a few minutes after startup. Pairing sets a long-lived HttpOnly
+session cookie. Run with --new-token to revoke every paired device.
 """
 import argparse
 import hashlib
@@ -41,6 +42,7 @@ SESSION_TTL = 30 * 24 * 3600
 LONG_POLL_SECONDS = 25
 PAIR_MAX_FAILS = 8
 PAIR_FAIL_WINDOW = 15 * 60
+PAIR_MINUTES = 10
 
 MIME = {
     "jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp",
@@ -128,7 +130,7 @@ def primary_ip():
 # ---------------------------------------------------------------- state
 
 class State:
-    def __init__(self, store: Path, max_bytes: int, new_token: bool):
+    def __init__(self, store: Path, max_bytes: int, new_token: bool, pair_minutes: int):
         self.store = store
         self.partial = store / ".partial"
         self.thumbs = store / ".thumbs"
@@ -147,12 +149,17 @@ class State:
             leftover.unlink(missing_ok=True)
         self.prune_thumbs()
 
-        self.token_file = CONFIG_DIR / "token"
         self.sessions_file = CONFIG_DIR / "sessions.json"
-        if new_token or not self.token_file.exists():
-            self._write_private(self.token_file, secrets.token_urlsafe(32))
+        (CONFIG_DIR / "token").unlink(missing_ok=True)  # older versions kept a permanent pairing token here
+        if new_token:
             self._write_private(self.sessions_file, "{}")
-        self.token = self.token_file.read_text().strip()
+        # Pairing secrets are fresh every run and never written to disk, so a QR code someone
+        # photographed or a pairing URL left in browser history stops working after a restart.
+        self.token = secrets.token_urlsafe(32)
+        self.pair_until = time.time() + pair_minutes * 60 if pair_minutes > 0 else None
+        # One-time, loopback-only code for auto-opening this PC's browser, so the phone token
+        # doesn't end up in the desktop browser's history.
+        self.local_code = secrets.token_urlsafe(32)
         try:
             self.sessions = json.loads(self.sessions_file.read_text())
         except (OSError, ValueError):
@@ -205,8 +212,20 @@ class State:
             rec = self.fails.setdefault(ip, [0, time.time()])
             rec[0] += 1
 
-    def check_token(self, t: str) -> bool:
-        return hmac.compare_digest(t.encode(), self.token.encode())
+    def pair_succeeded(self, ip: str):
+        with self.lock:
+            self.fails.pop(ip, None)
+
+    def pairing_open(self) -> bool:
+        return self.pair_until is None or time.time() < self.pair_until
+
+    def check_token(self, t: str, local: bool) -> bool:
+        t = t.encode()
+        with self.lock:
+            if local and self.local_code and hmac.compare_digest(t, self.local_code.encode()):
+                self.local_code = None
+                return True
+        return self.pairing_open() and hmac.compare_digest(t, self.token.encode())
 
     # ---- files
 
@@ -632,10 +651,11 @@ class Handler(BaseHTTPRequestHandler):
         ip = self.client_address[0]
         if self.state.pair_blocked(ip):
             return self.error(429, "Too many failed attempts. Try again later.")
-        if not token or not self.state.check_token(token):
+        if not token or not self.state.check_token(token, self.is_local):
             self.state.pair_failed(ip)
-            return self.error(403, "Invalid or expired pairing link. Scan the QR code again.")
-        self.state.fails.pop(ip, None)
+            return self.error(403, "Invalid or expired pairing link. Restart PhoneDrop on the computer "
+                                   "and scan the new QR code.")
+        self.state.pair_succeeded(ip)
         sid = self.state.new_session(ip, self.headers.get("User-Agent", ""))
         cookie = f"{SESSION_COOKIE}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
         if self.is_tls:
@@ -866,21 +886,26 @@ def main():
     ap = argparse.ArgumentParser(description="Receive images from your phone over the local network.")
     ap.add_argument("--port", type=int, default=8443, help="HTTPS port for the phone (default 8443)")
     ap.add_argument("--local-port", type=int, default=8080, help="localhost HTTP port for this computer (default 8080)")
-    ap.add_argument("--bind", default="0.0.0.0", help="address for the LAN listener (default all interfaces)")
+    ap.add_argument("--bind", help="address for the LAN listener (default: this computer's LAN address; "
+                                   "0.0.0.0 = all interfaces)")
     ap.add_argument("--dir", default=str(Path.home() / "Pictures" / "PhoneDrop"), help="where images are saved")
     ap.add_argument("--max-mb", type=int, default=200, help="max size per file in MB (default 200)")
     ap.add_argument("--clip-cache", type=int, default=CLIP_KEEP,
                     help=f"keep ready-to-paste PNGs for this many recent images (default {CLIP_KEEP}, ~17 MB each)")
-    ap.add_argument("--new-token", action="store_true", help="rotate the pairing token and unpair all devices")
+    ap.add_argument("--pair-minutes", type=int, default=PAIR_MINUTES,
+                    help=f"how long after startup new devices can pair (default {PAIR_MINUTES}, 0 = no limit)")
+    ap.add_argument("--new-token", action="store_true", help="unpair all devices")
     ap.add_argument("--no-browser", action="store_true", help="don't open the panel in your browser")
     args = ap.parse_args()
 
-    state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token)
+    state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token,
+                  args.pair_minutes)
     if shutil.which("wl-copy") and (shutil.which("vips") or shutil.which("magick")):
         state.clipper = Clipper(state, max(1, args.clip_cache))
         state.clipper.scan()
     ips = lan_ips()
     ip = primary_ip()
+    bind = args.bind or ip
     cert, key = ensure_cert(ips)
 
     hosts = {f"127.0.0.1:{args.local_port}", f"localhost:{args.local_port}",
@@ -895,7 +920,7 @@ def main():
     ctx.load_cert_chain(cert, key)
 
     try:
-        lan = TLSServer((args.bind, args.port), Handler, ctx)
+        lan = TLSServer((bind, args.port), Handler, ctx)
         local = PlainServer(("127.0.0.1", args.local_port), Handler)
     except OSError as e:
         sys.exit(f"Could not start server: {e}  (is PhoneDrop already running? try --port / --local-port)")
@@ -904,7 +929,7 @@ def main():
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     phone_url = f"https://{ip}:{args.port}/pair?t={state.token}"
-    pc_url = f"http://127.0.0.1:{args.local_port}/pair?t={state.token}"
+    pc_url = f"http://127.0.0.1:{args.local_port}/pair?t={state.local_code}"
 
     print("\n  PhoneDrop is running")
     print(f"  Saving to:   {state.store}")
@@ -915,7 +940,12 @@ def main():
     print("  self-signed certificate once — check the fingerprint above and continue):\n")
     print_qr(phone_url)
     print("  Keep this QR private: anyone who scans it can upload to and read from the panel.")
+    if state.pair_until:
+        print(f"  Pairing is open until {time.strftime('%H:%M', time.localtime(state.pair_until))}; "
+              "restart PhoneDrop to pair another device later.")
     print("  Run with --new-token to unpair every device.  Ctrl+C to stop.\n")
+    if bind != "0.0.0.0" and not ipaddress.ip_address(bind).is_private:
+        print(f"  WARNING: {bind} is not a private address. The phone port may be reachable from the internet.\n")
 
     if not args.no_browser and shutil.which("xdg-open"):
         subprocess.Popen(["xdg-open", pc_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

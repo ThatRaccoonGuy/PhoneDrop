@@ -11,8 +11,9 @@ python3 phonedrop.py
 ```
 
 1. A QR code appears in the terminal and the panel opens in your browser.
-2. Scan the QR with your phone (same Wi-Fi). Accept the self-signed certificate warning once
-   (compare the SHA-256 fingerprint printed in the terminal if you want to be sure).
+2. Within 10 minutes, scan the QR with your phone (same Wi-Fi). Accept the self-signed certificate
+   warning once (compare the SHA-256 fingerprint printed in the terminal if you want to be sure).
+   Paired devices stay paired for 30 days; to pair a new one later, restart PhoneDrop.
 3. Tap **Send photos**. Images show up live on the computer, saved to `~/Pictures/PhoneDrop`.
 4. On the computer: **Copy** puts the image on the clipboard as PNG (each photo is converted in the
    background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
@@ -32,17 +33,23 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 |---|---|---|
 | `--port` | 8443 | HTTPS port for the phone |
 | `--local-port` | 8080 | localhost-only HTTP port for this PC |
+| `--bind` | LAN address | interface for the phone port (`0.0.0.0` = all interfaces) |
+| `--pair-minutes` | 10 | how long after startup new devices can pair (`0` = no limit) |
 | `--dir` | `~/Pictures/PhoneDrop` | where images are saved |
 | `--max-mb` | 200 | per-file size limit |
 | `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
-| `--new-token` | | new QR code, unpairs every device |
+| `--new-token` | | unpairs every device |
 | `--no-browser` | | don't auto-open the panel |
 
 ## Security
 
-- **Pairing required**: a 256-bit secret in the QR code. Scanning it sets a 30-day HttpOnly session
-  cookie, and the token is removed from the URL straight away. Session IDs are stored hashed in
+- **Pairing required**: a 256-bit secret in the QR code, new on every run, never saved to disk, and
+  only accepted for 10 minutes after startup. An old QR code or a pairing link left in browser
+  history is useless. The PC's browser pairs with a separate one-time code that only works from
+  this computer. Pairing sets a 30-day HttpOnly session cookie; session IDs are stored hashed in
   `~/.config/phonedrop/` (mode 0700).
+- **LAN only by default**: the phone port listens on your LAN address, not on every interface
+  (VPNs, Docker networks, public IPs). PhoneDrop warns you if that address isn't a private one.
 - **Encrypted on the LAN**: TLS 1.2+ with an auto-generated ECDSA certificate. The PC uses plain HTTP,
   but only on 127.0.0.1.
 - **Brute-force lockout**: 8 bad pairing attempts per IP → 15-minute block.
@@ -53,6 +60,25 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   atomically and never overwrite each other, and there are checks for size and free disk space.
 - **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer, and image files are served sandboxed.
 - Clipboard copy and "Open folder" work only from this computer.
+
+### Know this before you use it
+
+- **Use it on networks you trust** (home Wi-Fi, a phone hotspot). The certificate is self-signed, so
+  the very first connection can't be verified automatically. On public or shared Wi-Fi, an attacker
+  could intercept that first visit and steal the pairing secret. Comparing the SHA-256 fingerprint
+  shown on your phone with the one printed in the terminal rules this out.
+- **A paired device has full access**: it can see, download, upload and delete every image in the
+  PhoneDrop folder. Only pair your own devices, and don't show the QR code to anyone (or in a
+  screenshot or stream) while the pairing window is open. Run with `--new-token` if a paired
+  device is lost.
+- **Images are processed by ImageMagick / libvips** (previews and clipboard conversion). Bugs in
+  image decoders have been exploited before, so keep them updated. Only paired devices can upload.
+- **Don't expose it to the internet**: no port forwarding, and don't use `--bind 0.0.0.0` on a
+  machine with a public IP. It's built for a local network.
+- **The PC side is plain HTTP on 127.0.0.1**, which never leaves your computer. Other user accounts
+  on the same computer can reach the port, but they still need a paired session.
+- **Paired sessions last 30 days** and aren't tied to the device's IP. Anyone who copies the
+  session cookie out of a paired browser gets the same access.
 
 ## License
 
