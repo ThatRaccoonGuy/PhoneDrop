@@ -261,13 +261,14 @@ function makeCard(f) {
     ? el('button', { class: 'copy-btn', onclick: () => copyImage(byName(f.name)) }, 'Copy')
     : f.kind === 'file'
       ? el('span', { class: 'copy-btn', hidden: '' })
-      : el('a', { class: 'btn', href: f.url, target: '_blank', rel: 'noopener' }, 'Open');
+      : el('a', { class: 'btn open-btn', href: f.url, target: '_blank', rel: 'noopener' }, 'Open');
+  const share = el('button', { class: 'share-btn', onclick: () => shareFile(byName(f.name)) }, 'Share');
   const card = el('figure', { class: 'card' },
     wrap,
     el('figcaption', {},
       el('div', { class: 'meta' }, el('span', { class: 'ellipsis' }, f.name), el('span', { class: 'meta-sub muted' })),
       el('div', { class: `row${f.kind === 'file' ? ' two' : ''}` },
-        primary,
+        primary, share,
         el('a', { class: 'btn', href: `/f/${enc(f.name)}?dl=1`, download: f.name }, 'Save'),
         el('button', { class: 'danger icon', 'aria-label': 'Delete', onclick: () => remove(byName(f.name)) }, '🗑'))));
   card.dataset.url = f.url;
@@ -401,6 +402,44 @@ async function removeNote(n) {
   } catch (e) { toast(e.message, true); }
 }
 
+// ---------------------------------------------------------------- share sheet (phones)
+
+// navigator.share with files opens the phone's share sheet, where iOS offers "Save Image" /
+// "Save Video" and Android offers the gallery, messaging apps, etc.
+const SHARE_CACHE_MAX = 50 * 1024 * 1024;
+const shareCache = new Map();
+
+function canShareFiles() {
+  return !info.local && typeof navigator.share === 'function' && typeof navigator.canShare === 'function';
+}
+
+async function fetchForShare(f) {
+  let file = shareCache.get(f.name);
+  if (file) return file;
+  const blob = await (await fetch(f.url, { credentials: 'same-origin' })).blob();
+  file = new File([blob], f.name, { type: f.type === 'application/octet-stream' ? '' : f.type });
+  if (f.size <= SHARE_CACHE_MAX) {
+    shareCache.set(f.name, file);
+    if (shareCache.size > 6) shareCache.delete(shareCache.keys().next().value);
+  }
+  return file;
+}
+
+async function shareFile(f) {
+  if (!f) return;
+  const cached = shareCache.has(f.name);
+  try {
+    const file = await fetchForShare(f);
+    if (!navigator.canShare({ files: [file] })) throw new Error("This file type can't be shared here");
+    await navigator.share({ files: [file], title: f.name });
+  } catch (e) {
+    if (e.name === 'AbortError') return; // user closed the sheet
+    // Safari only allows the share sheet right after a tap; a slow download can use that up.
+    if (e.name === 'NotAllowedError' && !cached) return toast('Ready — tap Share again');
+    toast(`Share failed: ${e.message}`, true);
+  }
+}
+
 // ---------------------------------------------------------------- clipboard
 
 async function toPng(blob) {
@@ -473,6 +512,7 @@ function showViewer() {
     file.querySelector('.viewer-size').textContent = human(f.size);
   }
   applyCopyButton($('#viewerCopy'), f);
+  if (canShareFiles() && f.size <= SHARE_CACHE_MAX) fetchForShare(f).catch(() => {}); // so Share is instant
   const open = $('#viewerOpen');
   open.hidden = isImage(f) || f.kind === 'file';
   open.href = f.url;
@@ -516,6 +556,7 @@ async function init() {
     info = await (await api('/api/info')).json();
   } catch {}
   if (files.length) render(files); // re-apply now that we know whether this is the computer
+  document.body.classList.toggle('can-share', canShareFiles());
   if (info.local) {
     $('#hint').textContent = 'Drop files here, paste images or text with Ctrl+V, or send them from your phone.';
     if (info.folder) {
@@ -582,6 +623,7 @@ async function init() {
   $('#viewerPrev').onclick = () => step(-1);
   $('#viewerNext').onclick = () => step(1);
   $('#viewerCopy').onclick = () => copyImage(files[viewerIndex]);
+  $('#viewerShare').onclick = () => shareFile(files[viewerIndex]);
   $('#viewerDel').onclick = () => remove(files[viewerIndex]);
   viewer.addEventListener('click', (e) => { if (e.target === viewer) viewer.close(); });
   document.addEventListener('keydown', (e) => {

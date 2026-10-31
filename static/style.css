@@ -121,6 +121,11 @@ figcaption { padding: 8px; display: grid; gap: 8px; }
 .meta-sub { font-size: 12px; }
 .row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; }
 .row.two { grid-template-columns: 1fr auto; }
+/* On phones that have a share sheet, Share replaces Copy/Open in the card row (the viewer keeps everything). */
+.share-btn { display: none; }
+body.can-share .share-btn { display: inline-flex; }
+body.can-share .row.two { grid-template-columns: 1fr 1fr auto; }
+body.can-share .row .copy-btn, body.can-share .row .open-btn { display: none; }
 .row > * { padding: 6px 8px; font-size: 14px; }
 .icon { width: 38px; }
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
@@ -136,8 +141,9 @@ dialog::backdrop { background: rgba(0,0,0,.6); }
 .viewer-img audio { width: min(100%, 480px); }
 .viewer-file { display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .viewer-ext { font-size: 64px; font-weight: 800; letter-spacing: .05em; color: var(--muted); }
-.viewer-actions { display: flex; justify-content: center; gap: 8px; padding: 12px 12px max(12px, env(safe-area-inset-bottom)); }
+.viewer-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; padding: 12px 12px max(12px, env(safe-area-inset-bottom)); }
 .viewer-actions > * { min-width: 64px; }
+@media (max-width: 480px) { .viewer-actions { gap: 6px; } .viewer-actions > * { min-width: 0; padding: 8px 10px; font-size: 14px; } }
 
 .toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translate(-50%, 20px);
   background: var(--panel2); border: 1px solid var(--line); padding: 10px 16px; border-radius: 10px; opacity: 0;

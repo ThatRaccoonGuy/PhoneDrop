@@ -17,6 +17,8 @@ python3 phonedrop.py
    Paired devices stay paired for 30 days; to pair a new one later, restart PhoneDrop.
 3. Tap **Send photos & videos** (or **Send files** for PDFs, documents, archives…). They show up
    live on the computer, saved to `~/Pictures/PhoneDrop`. Videos and audio play in the panel.
+   Going the other way, **Share** on the phone opens its share sheet, where you can save to the
+   camera roll ("Save Image" / "Save Video" on iPhone) or pass the file to any app.
 4. On the computer: **Copy** puts the image on the clipboard as PNG (each photo is converted in the
    background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
    **Download all** gives a zip, and **Select** lets you pick several files to zip or delete together. You can also drag-and-drop or Ctrl+V images into the PC
