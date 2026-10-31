@@ -27,6 +27,7 @@ import time
 import unicodedata
 import urllib.parse
 import zipfile
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,6 +51,7 @@ STATIC_FILES = {
     "style.css": "text/css; charset=utf-8",
     "icon.svg": "image/svg+xml",
 }
+CLIP_KEEP = 30  # PNG clipboard copies kept for this many most-recently-used images
 THUMB_SIZES = (480, 1600)  # grid, and the viewer for formats browsers can't display (HEIC/TIFF)
 GENERIC_STEMS = {"image", "photo", "img", "file", "blob", "picture", "upload"}
 
@@ -133,6 +135,7 @@ class State:
         self.thumb_locks = {}
         self.thumb_slots = threading.BoundedSemaphore(2)  # cap concurrent decoders
         self.max_bytes = max_bytes
+        self.clipper = None
         self.lock = threading.Lock()
         self.fails = {}  # ip -> [count, first_ts]
         CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -208,7 +211,8 @@ class State:
     # ---- files
 
     def version(self) -> str:
-        return str(self.store.stat().st_mtime_ns)
+        tick = self.clipper.tick if self.clipper else 0
+        return f"{self.store.stat().st_mtime_ns}.{tick}"
 
     def resolve(self, name: str):
         """Map a client-supplied file name to a path inside the store, or None."""
@@ -287,10 +291,181 @@ class State:
                 continue
             st = p.stat()
             q = urllib.parse.quote(p.name)
-            files.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime, "type": MIME[ext],
-                          "url": f"/f/{q}?v={st.st_mtime_ns}", "thumb": f"/t/{q}?v={st.st_mtime_ns}"})
+            f = {"name": p.name, "size": st.st_size, "mtime": st.st_mtime, "type": MIME[ext],
+                 "url": f"/f/{q}?v={st.st_mtime_ns}", "thumb": f"/t/{q}?v={st.st_mtime_ns}"}
+            if self.clipper:
+                f["clip"], f["clipPct"] = self.clipper.status(p)
+            files.append(f)
         files.sort(key=lambda f: f["mtime"], reverse=True)
         return files
+
+
+# ---------------------------------------------------------------- clipboard PNGs
+
+class Clipper:
+    """Converts images to PNG in the background so Copy is instant.
+
+    Most apps only accept image/png when pasting, and converting a 12 MP photo on demand takes
+    seconds. Conversion runs one image at a time, newest first, and reports progress so the panel
+    can show it. PNGs are kept for the `keep` most recently used images (least recently used evicted).
+    """
+
+    def __init__(self, state: State, keep: int):
+        self.state = state
+        self.dir = state.store / ".clip"
+        self.dir.mkdir(exist_ok=True, mode=0o700)
+        self.keep = keep
+        self.cv = threading.Condition()
+        self.queue = deque()
+        self.current = None  # name being converted
+        self.pct = 0
+        self.failed = set()  # cache file names that failed to convert
+        self.tick = 0  # bumped on every visible status change
+        for t in self.dir.glob(".*"):
+            t.unlink(missing_ok=True)
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def path(self, p: Path) -> Path:
+        key = hashlib.sha256(p.name.encode()).hexdigest()[:20]
+        return self.dir / f"{key}-{p.stat().st_mtime_ns}.png"
+
+    def ready_source(self, p: Path):
+        """The file to put on the clipboard, or None if it isn't converted yet."""
+        if p.suffix.lower() == ".png":
+            return p
+        out = self.path(p)
+        return out if out.exists() else None
+
+    def status(self, p: Path):
+        if self.ready_source(p):
+            return "ready", 100
+        with self.cv:
+            if self.current == p.name:
+                return "converting", self.pct
+            if p.name in self.queue:
+                return "queued", 0
+        return ("error" if self.path(p).name in self.failed else "none"), 0
+
+    def bump(self):
+        self.tick += 1
+
+    def request(self, name: str, front=False):
+        with self.cv:
+            if name == self.current:
+                return
+            if name in self.queue:
+                if not front:
+                    return
+                self.queue.remove(name)
+            self.queue.appendleft(name) if front else self.queue.append(name)
+            self.bump()
+            self.cv.notify()
+
+    def forget(self, name: str):
+        key = hashlib.sha256(name.encode()).hexdigest()[:20]
+        with self.cv:
+            if name in self.queue:
+                self.queue.remove(name)
+        for t in self.dir.glob(f"{key}-*.png"):
+            t.unlink(missing_ok=True)
+
+    def scan(self):
+        """Drop PNGs of deleted/changed images, and queue the newest images that lack one."""
+        files = [self.state.resolve(f["name"]) for f in self.state.listing()]
+        files = [p for p in files if p]
+        valid = {self.path(p).name for p in files}
+        for t in self.dir.glob("*.png"):
+            if t.name not in valid:
+                t.unlink(missing_ok=True)
+        self.evict()
+        for p in files[:self.keep]:
+            if not self.ready_source(p):
+                self.request(p.name)
+
+    def touch(self, png: Path):
+        if png.parent == self.dir:
+            os.utime(png)
+
+    def evict(self):
+        pngs = sorted(self.dir.glob("*.png"), key=lambda t: t.stat().st_mtime, reverse=True)
+        for t in pngs[self.keep:]:
+            t.unlink(missing_ok=True)
+
+    def run(self):
+        while True:
+            with self.cv:
+                while not self.queue:
+                    self.cv.wait()
+                name = self.queue.popleft()
+                self.current, self.pct = name, 0
+                self.bump()
+            try:
+                p = self.state.resolve(name)
+                if p and not self.ready_source(p):
+                    out = self.path(p)
+                    if self.convert(p, out):
+                        self.failed.discard(out.name)
+                        self.evict()
+                    else:
+                        self.failed.add(out.name)
+            except Exception as e:  # never let the worker thread die
+                sys.stderr.write(f"clipboard conversion of {name} failed: {e}\n")
+            finally:
+                with self.cv:
+                    self.current = None
+                    self.bump()
+
+    def convert(self, src: Path, out: Path) -> bool:
+        tmp = self.dir / f".{secrets.token_hex(6)}.png"
+        try:
+            if shutil.which("vips") and self._vips(src, tmp):
+                pass
+            elif shutil.which("magick"):
+                r = subprocess.run(["magick", f"{src}[0]", "-auto-orient", "-define", "png:compression-level=1",
+                                    f"png:{tmp}"], capture_output=True, timeout=180)
+                if r.returncode:
+                    return False
+            else:
+                return False
+            if not tmp.exists() or not tmp.stat().st_size:
+                return False
+            os.replace(tmp, out)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _vips(self, src: Path, tmp: Path) -> bool:
+        # --vips-progress reports two phases: decoding the source (fast), then encoding the PNG.
+        proc = subprocess.Popen(["vips", "--vips-progress", "autorot", str(src), f"{tmp}[compression=1]"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 180
+        buf = b""
+        try:
+            while True:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                buf += chunk
+                *lines, buf = re.split(rb"[\r\n]", buf)
+                for line in lines:
+                    m = re.match(rb"vips (.+): (\d+)% complete", line.strip())
+                    if not m:
+                        continue
+                    pct = int(m.group(2))
+                    pct = 10 + pct * 0.9 if m.group(1).startswith(b"temp-") else pct * 0.1
+                    if int(pct) >= self.pct + 3 or pct >= 100:
+                        self.pct = min(99, int(pct))
+                        self.bump()
+                if time.time() > deadline:
+                    proc.kill()
+                    return False
+            return proc.wait(timeout=10) == 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
 
 # ---------------------------------------------------------------- HTTP
@@ -415,7 +590,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET":
             if path == "/api/info":
                 return self.send_json({"local": self.is_local, "maxBytes": self.state.max_bytes,
-                                       "serverCopy": self.is_local and bool(shutil.which("wl-copy")),
+                                       "serverCopy": self.is_local and self.state.clipper is not None,
                                        "folder": str(self.state.store) if self.is_local else None})
             if path == "/api/files":
                 return self.do_list(query.get("wait", [None])[0])
@@ -430,6 +605,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_upload()
             if path.startswith("/api/copy/"):
                 return self.do_copy(name)
+            if path.startswith("/api/prepare/"):
+                return self.do_prepare(name)
             if path == "/api/open-folder":
                 return self.do_open_folder()
             if path == "/api/logout":
@@ -550,6 +727,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self.error(409, "Could not pick a file name")
             self.log_message("received %s (%s)", final.name, human(length))
+            if st.clipper:
+                st.clipper.request(final.name)
             self.send_json({"name": final.name, "size": length}, 201)
         except (ConnectionError, TimeoutError, ssl.SSLError):
             self.close_connection = True
@@ -572,27 +751,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(404, "Not found")
         p.unlink()
         self.state.drop_thumbs(name)
+        if self.state.clipper:
+            self.state.clipper.forget(name)
         self.send_json({"ok": True})
 
     def do_copy(self, name):
-        if not self.is_local or not shutil.which("wl-copy"):
+        clipper = self.state.clipper
+        if not self.is_local or not clipper:
             return self.error(403, "Server-side copy is only available on this computer")
         p = self.state.resolve(name)
         if not p:
             return self.error(404, "Not found")
-        # Most apps only accept image/png when pasting, so convert everything else to PNG first.
-        src, mime, png = p, MIME[p.suffix[1:].lower()], None
-        if mime != "image/png":
-            png = self.state.partial / f"{secrets.token_hex(8)}.png"
-            for cmd in (["magick", f"{p}[0]", "-auto-orient", f"png:{png}"],
-                        ["vips", "autorot", str(p), str(png)]):
-                if shutil.which(cmd[0]):
-                    try:
-                        if subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0 and png.exists():
-                            src, mime = png, "image/png"
-                            break
-                    except subprocess.TimeoutExpired:
-                        pass
+        src, mime = clipper.ready_source(p), "image/png"
+        if not src:
+            status, _ = clipper.status(p)
+            if status != "error":
+                if status == "none":
+                    clipper.request(p.name, front=True)
+                return self.error(409, "Still converting — try again in a moment")
+            src, mime = p, MIME[p.suffix[1:].lower()]  # conversion failed: copy the original as-is
         try:
             with open(src, "rb") as f:
                 # wl-copy forks a background process that owns the clipboard. Its output must not be
@@ -601,11 +778,21 @@ class Handler(BaseHTTPRequestHandler):
                                    stderr=subprocess.DEVNULL, timeout=30)
         except subprocess.TimeoutExpired:
             return self.error(500, "wl-copy timed out")
-        finally:
-            if png:
-                png.unlink(missing_ok=True)
         if r.returncode:
             return self.error(500, "wl-copy failed")
+        clipper.touch(src)
+        self.send_json({"ok": True, "type": mime})
+
+    def do_prepare(self, name):
+        clipper = self.state.clipper
+        p = self.state.resolve(name)
+        if not self.is_local or not clipper:
+            return self.error(403, "Only available on this computer")
+        if not p:
+            return self.error(404, "Not found")
+        clipper.failed.discard(clipper.path(p).name)
+        if not clipper.ready_source(p):
+            clipper.request(p.name, front=True)
         self.send_json({"ok": True})
 
     def do_open_folder(self):
@@ -682,11 +869,16 @@ def main():
     ap.add_argument("--bind", default="0.0.0.0", help="address for the LAN listener (default all interfaces)")
     ap.add_argument("--dir", default=str(Path.home() / "Pictures" / "PhoneDrop"), help="where images are saved")
     ap.add_argument("--max-mb", type=int, default=200, help="max size per file in MB (default 200)")
+    ap.add_argument("--clip-cache", type=int, default=CLIP_KEEP,
+                    help=f"keep ready-to-paste PNGs for this many recent images (default {CLIP_KEEP}, ~17 MB each)")
     ap.add_argument("--new-token", action="store_true", help="rotate the pairing token and unpair all devices")
     ap.add_argument("--no-browser", action="store_true", help="don't open the panel in your browser")
     args = ap.parse_args()
 
     state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token)
+    if shutil.which("wl-copy") and (shutil.which("vips") or shutil.which("magick")):
+        state.clipper = Clipper(state, max(1, args.clip_cache))
+        state.clipper.scan()
     ips = lan_ips()
     ip = primary_ip()
     cert, key = ensure_cert(ips)

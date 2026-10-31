@@ -14,7 +14,8 @@ python3 phonedrop.py
 2. Scan the QR with your phone (same Wi-Fi). Accept the self-signed certificate warning once
    (compare the SHA-256 fingerprint printed in the terminal if you want to be sure).
 3. Tap **Send photos**. Images show up live on the computer, saved to `~/Pictures/PhoneDrop`.
-4. On the computer: **Copy** puts the image on the clipboard, **Save** downloads it,
+4. On the computer: **Copy** puts the image on the clipboard as PNG (each photo is converted in the
+   background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
    **Download all** gives a zip. You can also drag-and-drop or Ctrl+V images into the PC
    panel to get them onto your phone.
 
@@ -33,6 +34,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 | `--local-port` | 8080 | localhost-only HTTP port for this PC |
 | `--dir` | `~/Pictures/PhoneDrop` | where images are saved |
 | `--max-mb` | 200 | per-file size limit |
+| `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
 | `--new-token` | | new QR code, unpairs every device |
 | `--no-browser` | | don't auto-open the panel |
 

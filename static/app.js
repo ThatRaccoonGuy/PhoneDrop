@@ -177,6 +177,7 @@ function render(list) {
       cards.set(f.name, card);
     }
     card.querySelector('.meta-sub').textContent = `${human(f.size)} · ${ago(f.mtime)}`;
+    updateClip(card, f);
     if (grid.children[i] !== card) grid.insertBefore(card, grid.children[i] || null);
   });
   $('#empty').hidden = list.length > 0;
@@ -186,6 +187,38 @@ function render(list) {
     const cur = $('#viewerName').textContent;
     const idx = files.findIndex((f) => f.name === cur);
     idx < 0 ? $('#viewer').close() : (viewerIndex = idx);
+    if (idx >= 0) applyCopyButton($('#viewerCopy'), files[idx]);
+  }
+}
+
+// On this computer, Copy uses a PNG the server prepares in the background. Until it's ready the
+// image shows a progress overlay and Copy is disabled, so the clipboard only ever gets the finished image.
+function clipState(f) {
+  if (!info.serverCopy || !f.clip) return { label: 'Copy', disabled: false };
+  switch (f.clip) {
+    case 'ready': return { label: 'Copy', disabled: false };
+    case 'converting': return { label: `${f.clipPct}%`, disabled: true, busy: true, pct: f.clipPct, text: `Converting ${f.clipPct}%` };
+    case 'queued': return { label: 'Waiting…', disabled: true, busy: true, pct: 0, text: 'Waiting to convert…' };
+    case 'error': return { label: 'Copy original', disabled: false };
+    default: return { label: 'Prepare', disabled: false, title: 'Convert this image so it can be copied' };
+  }
+}
+
+function applyCopyButton(btn, f) {
+  const s = clipState(f);
+  btn.textContent = s.label;
+  btn.disabled = s.disabled;
+  btn.title = s.title || '';
+  return s;
+}
+
+function updateClip(card, f) {
+  const s = applyCopyButton(card.querySelector('.copy-btn'), f);
+  const overlay = card.querySelector('.convert');
+  overlay.hidden = !s.busy;
+  if (s.busy) {
+    overlay.querySelector('i').style.width = `${s.pct}%`;
+    overlay.querySelector('.convert-label').textContent = s.text;
   }
 }
 
@@ -196,11 +229,15 @@ function makeCard(f) {
     else thumb.replaceWith(el('div', { class: 'noprev' }, f.type.split('/')[1].toUpperCase()));
   });
   const card = el('figure', { class: 'card' },
-    el('button', { class: 'thumb', 'aria-label': `Open ${f.name}`, onclick: () => openViewer(f.name) }, thumb),
+    el('div', { class: 'thumb-wrap' },
+      el('button', { class: 'thumb', 'aria-label': `Open ${f.name}`, onclick: () => openViewer(f.name) }, thumb),
+      el('div', { class: 'convert', hidden: '' },
+        el('div', { class: 'convert-bar' }, el('i')),
+        el('span', { class: 'convert-label' }))),
     el('figcaption', {},
       el('div', { class: 'meta' }, el('span', { class: 'ellipsis' }, f.name), el('span', { class: 'meta-sub muted' })),
       el('div', { class: 'row' },
-        el('button', { onclick: () => copyImage(byName(f.name)) }, 'Copy'),
+        el('button', { class: 'copy-btn', onclick: () => copyImage(byName(f.name)) }, 'Copy'),
         el('a', { class: 'btn', href: `/f/${enc(f.name)}?dl=1`, download: f.name }, 'Save'),
         el('button', { class: 'danger icon', 'aria-label': 'Delete', onclick: () => remove(byName(f.name)) }, '🗑'))));
   card.dataset.url = f.url;
@@ -232,9 +269,15 @@ async function copyImage(f) {
   if (!f) return;
   if (info.serverCopy) {
     try {
-      await api(`/api/copy/${enc(f.name)}`, { method: 'POST' });
-      return toast('Copied to clipboard');
-    } catch (e) { /* fall through to the browser clipboard */ }
+      if (f.clip === 'none') {
+        await api(`/api/prepare/${enc(f.name)}`, { method: 'POST' });
+        return toast('Converting… Copy unlocks when it\'s done');
+      }
+      const r = await (await api(`/api/copy/${enc(f.name)}`, { method: 'POST' })).json();
+      return toast(r.type === 'image/png' ? 'Copied to clipboard' : 'Copied the original (PNG conversion failed)');
+    } catch (e) {
+      return toast(e.message, true);
+    }
   }
   try {
     if (!navigator.clipboard?.write || !window.ClipboardItem) throw new Error('Clipboard not supported in this browser');
@@ -263,6 +306,7 @@ function showViewer() {
   const img = $('#viewerImg');
   img.hidden = false;
   img.src = previewable(f) ? f.url : `${f.thumb}&size=1600`;
+  applyCopyButton($('#viewerCopy'), f);
   $('#viewerDl').href = `/f/${enc(f.name)}?dl=1`;
   $('#viewerDl').setAttribute('download', f.name);
 }
@@ -302,6 +346,7 @@ async function init() {
   try {
     info = await (await api('/api/info')).json();
   } catch {}
+  if (files.length) render(files); // re-apply now that we know whether this is the computer
   if (info.local) {
     $('#hint').textContent = 'Drop images here, paste with Ctrl+V, or send them from your phone.';
     if (info.folder) {
