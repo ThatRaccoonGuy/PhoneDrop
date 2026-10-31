@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta name="referrer" content="no-referrer">
+<title>PhoneDrop</title>
+<link rel="icon" href="/static/icon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><img src="/static/icon.svg" alt=""><span>PhoneDrop</span>
+    <span id="status" class="dot" title="Connecting…"></span></div>
+  <div class="actions">
+    <button id="openFolder" class="ghost" hidden>Open folder</button>
+    <a id="zipAll" class="ghost btn" href="/api/zip" download>Download all</a>
+  </div>
+</header>
+
+<main>
+  <section id="drop" class="drop">
+    <input id="picker" type="file" accept="image/*" multiple hidden>
+    <button id="pick" class="primary big">Send photos</button>
+    <p class="hint" id="hint">Pick photos from your phone. They appear on the computer instantly.</p>
+  </section>
+
+  <section id="queue" class="queue" hidden></section>
+
+  <section>
+    <div class="section-head">
+      <h2>Received <span id="count" class="muted"></span></h2>
+    </div>
+    <div id="empty" class="empty" hidden>Nothing here yet.</div>
+    <div id="grid" class="grid"></div>
+  </section>
+</main>
+
+<dialog id="viewer">
+  <div class="viewer-top">
+    <span id="viewerName" class="ellipsis"></span>
+    <button id="viewerClose" class="ghost" aria-label="Close">✕</button>
+  </div>
+  <div class="viewer-img"><img id="viewerImg" alt=""></div>
+  <div class="viewer-actions">
+    <button id="viewerPrev" class="ghost" aria-label="Previous">‹</button>
+    <button id="viewerCopy">Copy</button>
+    <a id="viewerDl" class="btn" download>Download</a>
+    <button id="viewerDel" class="danger">Delete</button>
+    <button id="viewerNext" class="ghost" aria-label="Next">›</button>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="dropOverlay" class="drop-overlay" hidden>Drop images to upload</div>
+</body>
+</html>
