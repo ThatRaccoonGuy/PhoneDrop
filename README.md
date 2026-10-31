@@ -41,6 +41,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 | `--dir` | `~/Pictures/PhoneDrop` | where images are saved |
 | `--max-mb` | 200 | per-file size limit |
 | `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
+| `--keep-metadata` | | don't strip EXIF/XMP metadata from received images |
 | `--new-token` | | unpairs every device |
 | `--no-browser` | | don't auto-open the panel |
 
@@ -61,6 +62,11 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 - **Upload validation**: the type is checked from the file's magic bytes (JPEG, PNG, GIF, WebP,
   HEIC, AVIF, BMP, TIFF). SVG and other files are rejected. Names are sanitized, files are written
   atomically and never overwrite each other, and there are checks for size and free disk space.
+- **Metadata stripped on arrival**: phone photos carry GPS coordinates, the phone model and serial
+  numbers, and often a hidden trailer (embedded "motion photo" video, depth map). PhoneDrop removes
+  all of that from JPEG, PNG and WebP files without re-encoding them (pixels stay identical, only
+  the orientation tag is kept). HEIC/AVIF/TIFF are stored as-is; the terminal log says which.
+  Use `--keep-metadata` to turn this off.
 - **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer, and image files are served sandboxed.
 - Clipboard copy and "Open folder" work only from this computer.
 

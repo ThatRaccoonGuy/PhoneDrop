@@ -87,6 +87,160 @@ def sniff_image(head: bytes):
     return None
 
 
+# ---------------------------------------------------------------- metadata stripping
+#
+# Phone photos carry EXIF/XMP blocks with GPS coordinates, the phone model, serial numbers, and
+# sometimes an embedded video or depth map after the image. These functions remove that without
+# re-encoding the pixels, so there is zero quality loss. Only the EXIF orientation is kept, because
+# without it photos would show up rotated.
+
+JPEG_KEEP = {0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,  # SOF*/DHT
+             0xDB, 0xDD, 0xE0, 0xEE}  # DQT, DRI, APP0 (JFIF), APP14 (Adobe colour transform)
+STRIPPABLE = {"jpg", "png", "webp"}
+
+
+def exif_orientation(app1: bytes):
+    """Orientation (1-8) from an Exif APP1 payload, or None."""
+    try:
+        if not app1.startswith(b"Exif\0\0"):
+            return None
+        t = app1[6:]
+        end = "<" if t[:2] == b"II" else ">" if t[:2] == b"MM" else None
+        if not end:
+            return None
+        ifd = int.from_bytes(t[4:8], "little" if end == "<" else "big")
+        n = int.from_bytes(t[ifd:ifd + 2], "little" if end == "<" else "big")
+        for i in range(n):
+            e = t[ifd + 2 + 12 * i: ifd + 14 + 12 * i]
+            tag = int.from_bytes(e[0:2], "little" if end == "<" else "big")
+            if tag == 0x0112:
+                v = int.from_bytes(e[8:10], "little" if end == "<" else "big")
+                return v if 1 <= v <= 8 else None
+    except (IndexError, ValueError):
+        pass
+    return None
+
+
+def minimal_exif(orientation: int) -> bytes:
+    """An APP1 segment whose only tag is Orientation."""
+    tiff = b"II*\0" + (8).to_bytes(4, "little") + (1).to_bytes(2, "little")
+    tiff += (0x0112).to_bytes(2, "little") + (3).to_bytes(2, "little") + (1).to_bytes(4, "little")
+    tiff += orientation.to_bytes(2, "little") + b"\0\0" + b"\0\0\0\0"
+    payload = b"Exif\0\0" + tiff
+    return b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload
+
+
+def _copy_until(src, dst, end_marker: bytes, chunk=1024 * 1024):
+    """Copy src to dst up to and including end_marker; anything after it is dropped."""
+    carry = b""
+    while True:
+        buf = src.read(chunk)
+        if not buf:
+            dst.write(carry)
+            return
+        data = carry + buf
+        i = data.find(end_marker)
+        if i >= 0:
+            dst.write(data[:i + len(end_marker)])
+            return
+        dst.write(data[:-1])
+        carry = data[-1:]
+
+
+def strip_jpeg(src, dst):
+    if src.read(2) != b"\xff\xd8":
+        raise ValueError("not a JPEG")
+    dst.write(b"\xff\xd8")
+    orientation = None
+    while True:
+        marker = src.read(2)
+        if len(marker) < 2 or marker[0] != 0xFF:
+            raise ValueError("bad segment")
+        kind = marker[1]
+        if kind == 0xFF:
+            src.seek(-1, 1)
+            continue
+        if kind == 0xDA:  # start of scan: write orientation, then copy the image data up to EOI
+            if orientation and orientation != 1:
+                dst.write(minimal_exif(orientation))
+            dst.write(marker)
+            _copy_until(src, dst, b"\xff\xd9")
+            return
+        length = int.from_bytes(src.read(2), "big")
+        payload = src.read(length - 2)
+        if len(payload) != length - 2:
+            raise ValueError("truncated segment")
+        if kind == 0xE1 and orientation is None:
+            orientation = exif_orientation(payload)
+        keep = kind in JPEG_KEEP or (kind == 0xE2 and payload.startswith(b"ICC_PROFILE\0"))
+        if keep:
+            dst.write(marker + length.to_bytes(2, "big") + payload)
+
+
+PNG_DROP = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
+
+
+def strip_png(src, dst):
+    sig = src.read(8)
+    if sig != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    dst.write(sig)
+    while True:
+        head = src.read(8)
+        if len(head) < 8:
+            raise ValueError("truncated")
+        length = int.from_bytes(head[:4], "big")
+        kind = head[4:]
+        body = src.read(length + 4)
+        if len(body) != length + 4:
+            raise ValueError("truncated chunk")
+        if kind not in PNG_DROP:
+            dst.write(head + body)
+        if kind == b"IEND":
+            return
+
+
+def strip_webp(src, dst):
+    head = src.read(12)
+    if head[:4] != b"RIFF" or head[8:] != b"WEBP":
+        raise ValueError("not a WebP")
+    chunks = []
+    while True:
+        h = src.read(8)
+        if len(h) < 8:
+            break
+        size = int.from_bytes(h[4:], "little")
+        body = src.read(size + (size & 1))
+        if len(body) < size:
+            raise ValueError("truncated chunk")
+        if h[:4] in (b"EXIF", b"XMP "):
+            continue
+        if h[:4] == b"VP8X":
+            body = bytes([body[0] & ~0x0C]) + body[1:]  # clear the EXIF and XMP flags
+        chunks.append(h + body)
+    total = sum(len(c) for c in chunks) + 4
+    dst.write(b"RIFF" + total.to_bytes(4, "little") + b"WEBP")
+    for c in chunks:
+        dst.write(c)
+
+
+def strip_metadata(path: Path, ext: str) -> bool:
+    """Rewrite the file without metadata. Returns False (file untouched) if the format isn't
+    supported or the file couldn't be parsed."""
+    fn = {"jpg": strip_jpeg, "png": strip_png, "webp": strip_webp}.get(ext)
+    if not fn:
+        return False
+    tmp = path.with_name(path.name + ".strip")
+    try:
+        with open(path, "rb") as src, open(tmp, "wb") as dst:
+            fn(src, dst)
+        os.replace(tmp, path)
+        return True
+    except (ValueError, OSError):
+        tmp.unlink(missing_ok=True)
+        return False
+
+
 def safe_stem(name: str) -> str:
     name = unicodedata.normalize("NFKC", name).replace("\\", "/").rsplit("/", 1)[-1]
     stem = name.rsplit(".", 1)[0] if "." in name else name
@@ -132,8 +286,9 @@ def primary_ip():
 # ---------------------------------------------------------------- state
 
 class State:
-    def __init__(self, store: Path, max_bytes: int, new_token: bool, pair_minutes: int):
+    def __init__(self, store: Path, max_bytes: int, new_token: bool, pair_minutes: int, keep_metadata=False):
         self.store = store
+        self.keep_metadata = keep_metadata
         self.partial = store / ".partial"
         self.thumbs = store / ".thumbs"
         self.thumb_locks = {}
@@ -791,6 +946,9 @@ class Handler(BaseHTTPRequestHandler):
                 tmp.unlink(missing_ok=True)
                 return self.error(415, "That file is not a supported image")
 
+            stripped = False if st.keep_metadata else strip_metadata(tmp, ext)
+            if stripped:
+                length = tmp.stat().st_size
             stem = safe_stem(orig)
             os.chmod(tmp, 0o644)
             for i in range(10000):
@@ -802,7 +960,9 @@ class Handler(BaseHTTPRequestHandler):
                     continue
             else:
                 return self.error(409, "Could not pick a file name")
-            self.log_message("received %s (%s)", final.name, human(length))
+            self.log_message("received %s (%s, %s)", final.name, human(length),
+                             "metadata stripped" if stripped else "metadata kept" if st.keep_metadata
+                             else "metadata kept: can't strip ." + ext)
             if st.clipper:
                 st.clipper.request(final.name)
             self.send_json({"name": final.name, "size": length}, 201)
@@ -976,12 +1136,14 @@ def main():
                     help=f"keep ready-to-paste PNGs for this many recent images (default {CLIP_KEEP}, ~17 MB each)")
     ap.add_argument("--pair-minutes", type=int, default=PAIR_MINUTES,
                     help=f"how long after startup new devices can pair (default {PAIR_MINUTES}, 0 = no limit)")
+    ap.add_argument("--keep-metadata", action="store_true",
+                    help="don't strip EXIF/XMP metadata (GPS location, phone model…) from received images")
     ap.add_argument("--new-token", action="store_true", help="unpair all devices")
     ap.add_argument("--no-browser", action="store_true", help="don't open the panel in your browser")
     args = ap.parse_args()
 
     state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token,
-                  args.pair_minutes)
+                  args.pair_minutes, args.keep_metadata)
     if shutil.which("wl-copy") and (shutil.which("vips") or shutil.which("magick")):
         state.clipper = Clipper(state, max(1, args.clip_cache))
         state.clipper.scan()
