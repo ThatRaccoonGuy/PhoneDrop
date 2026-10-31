@@ -46,6 +46,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 | `--max-mb` | 2048 | per-file size limit |
 | `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
 | `--keep-metadata` | | don't strip EXIF/XMP metadata from received images |
+| `--keep-days` | 0 | delete received files and notes after this many days (0 = keep forever) |
 | `--new-token` | | unpairs every device |
 | `--no-browser` | | don't auto-open the panel |
 

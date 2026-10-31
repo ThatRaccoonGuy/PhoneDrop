@@ -77,6 +77,7 @@ STATIC_FILES = {
 CLIP_KEEP = 30  # PNG clipboard copies kept for this many most-recently-used images
 THUMB_SIZES = (480, 1600)  # grid, and the viewer for formats browsers can't display (HEIC/TIFF)
 NOTE_MAX_CHARS = 20000
+CLEANUP_INTERVAL = 15 * 60
 NOTE_KEEP = 200
 GENERIC_STEMS = {"image", "photo", "img", "file", "blob", "picture", "upload"}
 
@@ -381,9 +382,11 @@ def primary_ip():
 # ---------------------------------------------------------------- state
 
 class State:
-    def __init__(self, store: Path, max_bytes: int, new_token: bool, pair_minutes: int, keep_metadata=False):
+    def __init__(self, store: Path, max_bytes: int, new_token: bool, pair_minutes: int, keep_metadata=False,
+                 keep_days=0):
         self.store = store
         self.keep_metadata = keep_metadata
+        self.keep_days = keep_days
         self.partial = store / ".partial"
         self.thumbs = store / ".thumbs"
         self.thumb_locks = {}
@@ -532,6 +535,44 @@ class State:
         except OSError:
             return None
         return p
+
+    def remove_file(self, name: str) -> bool:
+        p = self.resolve(name)
+        if not p:
+            return False
+        p.unlink()
+        self.drop_thumbs(name)
+        if self.clipper:
+            self.clipper.forget(name)
+        return True
+
+    # ---- automatic cleanup
+
+    def cleanup(self):
+        """Delete files and notes older than --keep-days. Returns (files, notes) removed."""
+        if not self.keep_days:
+            return 0, 0
+        cutoff = time.time() - self.keep_days * 86400
+        old = [f["name"] for f in self.listing() if f["mtime"] < cutoff]
+        removed = sum(self.remove_file(n) for n in old)
+        with self.lock:
+            before = len(self.notes)
+            self.notes = [n for n in self.notes if n.get("time", 0) >= cutoff]
+            dropped = before - len(self.notes)
+            if dropped:
+                self._save_notes()
+        return removed, dropped
+
+    def cleanup_forever(self):
+        while True:
+            try:
+                files, notes = self.cleanup()
+                if files or notes:
+                    sys.stderr.write(f"{time.strftime('%H:%M:%S')} cleanup: removed {files} file(s) and "
+                                     f"{notes} note(s) older than {self.keep_days} day(s)\n")
+            except Exception as e:  # keep the sweeper alive
+                sys.stderr.write(f"cleanup failed: {e}\n")
+            time.sleep(CLEANUP_INTERVAL)
 
     # ---- thumbnails (cached JPEGs, so the gallery doesn't pull full-size photos over Wi-Fi)
 
@@ -919,6 +960,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"local": self.is_local, "maxBytes": self.state.max_bytes,
                                        "serverCopy": self.is_local and self.state.clipper is not None,
                                        "textCopy": self.is_local and bool(shutil.which("wl-copy")),
+                                       "keepDays": self.state.keep_days,
                                        "folder": str(self.state.store) if self.is_local else None})
             if path == "/api/files":
                 return self.do_list(query.get("wait", [None])[0])
@@ -1126,18 +1168,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_common(200, "image/jpeg", len(data), {"Cache-Control": "private, max-age=604800"}, csp=FILE_CSP)
         self.wfile.write(data)
 
-    def remove_file(self, name) -> bool:
-        p = self.state.resolve(name)
-        if not p:
-            return False
-        p.unlink()
-        self.state.drop_thumbs(name)
-        if self.state.clipper:
-            self.state.clipper.forget(name)
-        return True
-
     def do_delete(self, name):
-        if not self.remove_file(name):
+        if not self.state.remove_file(name):
             return self.error(404, "Not found")
         self.send_json({"ok": True})
 
@@ -1146,7 +1178,7 @@ class Handler(BaseHTTPRequestHandler):
         names = body.get("names") if isinstance(body, dict) else None
         if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
             return self.error(400, "Expected a list of file names")
-        deleted = sum(self.remove_file(n) for n in names[:1000])
+        deleted = sum(self.state.remove_file(n) for n in names[:1000])
         self.log_message("deleted %d file(s)", deleted)
         self.send_json({"deleted": deleted})
 
@@ -1295,6 +1327,8 @@ def main():
                     help=f"keep ready-to-paste PNGs for this many recent images (default {CLIP_KEEP}, ~17 MB each)")
     ap.add_argument("--pair-minutes", type=int, default=PAIR_MINUTES,
                     help=f"how long after startup new devices can pair (default {PAIR_MINUTES}, 0 = no limit)")
+    ap.add_argument("--keep-days", type=int, default=0,
+                    help="delete received files and notes after this many days (default 0 = keep forever)")
     ap.add_argument("--keep-metadata", action="store_true",
                     help="don't strip EXIF/XMP metadata (GPS location, phone model…) from received images")
     ap.add_argument("--new-token", action="store_true", help="unpair all devices")
@@ -1302,7 +1336,9 @@ def main():
     args = ap.parse_args()
 
     state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token,
-                  args.pair_minutes, args.keep_metadata)
+                  args.pair_minutes, args.keep_metadata, max(0, args.keep_days))
+    if state.keep_days:
+        threading.Thread(target=state.cleanup_forever, daemon=True).start()
     if shutil.which("wl-copy") and (shutil.which("vips") or shutil.which("magick")):
         state.clipper = Clipper(state, max(1, args.clip_cache))
         state.clipper.scan()
@@ -1335,7 +1371,7 @@ def main():
     pc_url = f"http://127.0.0.1:{args.local_port}/pair?t={state.local_code}"
 
     print("\n  PhoneDrop is running")
-    print(f"  Saving to:   {state.store}")
+    print(f"  Saving to:   {state.store}" + (f"  (deleted after {state.keep_days} day(s))" if state.keep_days else ""))
     print(f"  This PC:     http://127.0.0.1:{args.local_port}")
     print(f"  Phone:       https://{ip}:{args.port}   (same Wi-Fi)")
     print(f"  Cert SHA-256 {cert_fingerprint(cert)}")

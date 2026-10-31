@@ -129,6 +129,7 @@ body.can-share .row .copy-btn, body.can-share .row .open-btn { display: none; }
 .row > * { padding: 6px 8px; font-size: 14px; }
 .icon { width: 38px; }
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+.keep-note { font-size: 13px; margin: -6px 2px 12px; }
 
 dialog#viewer { width: 100vw; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: 0; border: 0;
   background: rgba(5,6,8,.96); color: var(--text); display: none; flex-direction: column; }

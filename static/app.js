@@ -557,6 +557,11 @@ async function init() {
   } catch {}
   if (files.length) render(files); // re-apply now that we know whether this is the computer
   document.body.classList.toggle('can-share', canShareFiles());
+  if (info.keepDays) {
+    const k = $('#keepNote');
+    k.hidden = false;
+    k.textContent = `Files and text are deleted automatically after ${info.keepDays} day${info.keepDays > 1 ? 's' : ''}.`;
+  }
   if (info.local) {
     $('#hint').textContent = 'Drop files here, paste images or text with Ctrl+V, or send them from your phone.';
     if (info.folder) {
