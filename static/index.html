@@ -17,6 +17,7 @@
     <span id="status" class="dot" title="Connecting…"></span></div>
   <div class="actions">
     <button id="devicesBtn" class="ghost" hidden>Devices</button>
+    <button id="guestBtn" class="ghost" hidden>Guest link</button>
     <button id="openFolder" class="ghost" hidden>Open folder</button>
     <a id="zipAll" class="ghost btn" href="/api/zip" download>Download all</a>
   </div>
@@ -87,6 +88,27 @@
     <button id="devicesClose" class="ghost" aria-label="Close">✕</button>
   </div>
   <div id="deviceList" class="device-list"></div>
+</dialog>
+
+<dialog id="guest">
+  <div class="devices-top">
+    <h2>Guest link</h2>
+    <button id="guestClose" class="ghost" aria-label="Close">✕</button>
+  </div>
+  <div class="guest-body">
+    <p id="guestExplain" class="muted">Let someone who isn't paired send you files. The link is upload-only and
+      works once, within 10 minutes; their access then lasts a limited time.</p>
+    <button id="guestCreate" class="primary">Create link</button>
+    <div id="guestLink" class="guest-link" hidden>
+      <img id="guestQr" alt="QR code for the guest link" hidden>
+      <div class="guest-url">
+        <input id="guestUrl" type="text" readonly aria-label="Guest link">
+        <button id="guestCopy">Copy</button>
+      </div>
+      <p id="guestExpires" class="muted"></p>
+      <button id="guestRevoke" class="danger">Revoke link</button>
+    </div>
+  </div>
 </dialog>
 
 <div id="selbar" class="selbar" hidden>
