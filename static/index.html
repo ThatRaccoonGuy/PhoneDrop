@@ -16,12 +16,15 @@
   <div class="brand"><img src="/static/icon.svg" alt=""><span>PhoneDrop</span>
     <span id="status" class="dot" title="Connecting…"></span></div>
   <div class="actions">
+    <button id="devicesBtn" class="ghost" hidden>Devices</button>
     <button id="openFolder" class="ghost" hidden>Open folder</button>
     <a id="zipAll" class="ghost btn" href="/api/zip" download>Download all</a>
   </div>
 </header>
 
 <main>
+  <section id="pairBanner" class="pair-banner" hidden></section>
+
   <section id="drop" class="drop">
     <input id="picker" type="file" accept="image/*,video/*" multiple hidden>
     <input id="pickerAny" type="file" multiple hidden>
@@ -75,6 +78,14 @@
     <button id="viewerDel" class="danger">Delete</button>
     <button id="viewerNext" class="ghost" aria-label="Next">›</button>
   </div>
+</dialog>
+
+<dialog id="devices">
+  <div class="devices-top">
+    <h2>Devices</h2>
+    <button id="devicesClose" class="ghost" aria-label="Close">✕</button>
+  </div>
+  <div id="deviceList" class="device-list"></div>
 </dialog>
 
 <div id="selbar" class="selbar" hidden>

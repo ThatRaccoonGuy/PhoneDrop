@@ -526,6 +526,78 @@ function step(d) {
   showViewer();
 }
 
+// ---------------------------------------------------------------- devices (this computer only)
+
+// Like ago(), but keeps counting in days, for "paired 3 days ago".
+function agoDays(ts) {
+  const d = Math.floor(Math.max(0, Date.now() / 1000 - ts) / 86400);
+  return d < 1 ? ago(ts) : `${d} day${d > 1 ? 's' : ''} ago`;
+}
+
+async function decide(id, action) {
+  try {
+    await api(`/api/devices/${enc(id)}/${action}`, { method: 'POST' });
+    toast(action === 'approve' ? 'Device allowed' : 'Request denied');
+  } catch (e) { toast(e.message, true); }
+  if ($('#devices').open) loadDevices();
+}
+
+function decideButtons(d) {
+  return [el('button', { class: 'primary', onclick: () => decide(d.id, 'approve') }, 'Allow'),
+    el('button', { class: 'danger', onclick: () => decide(d.id, 'deny') }, 'Deny')];
+}
+
+// A device that scanned the QR shows up here until it is allowed or denied.
+function renderPending(list) {
+  const box = $('#pairBanner');
+  box.replaceChildren(...list.map((d) => el('div', { class: 'pair-row' },
+    el('span', { class: 'pair-text' }, `📱 ${d.name} (${d.ip}) wants to pair`),
+    el('div', { class: 'pair-actions' }, ...decideButtons(d)))));
+  box.hidden = !list.length;
+}
+
+async function loadDevices() {
+  let list;
+  try {
+    list = (await (await api('/api/devices')).json()).devices;
+  } catch (e) { return toast(e.message, true); }
+  $('#deviceList').replaceChildren(...(list.length ? list.map(deviceRow) : [el('p', { class: 'muted' }, 'No devices.')]));
+}
+
+function deviceRow(d) {
+  const tags = el('span', { class: 'tags' });
+  if (d.current) tags.append(el('span', { class: 'tag' }, 'this computer'));
+  if (d.status === 'pending') tags.append(el('span', { class: 'tag warn' }, 'waiting for approval'));
+  if (d.role === 'guest') tags.append(el('span', { class: 'tag' }, 'guest'));
+  const sub = d.status === 'pending' ? `asked ${ago(d.created)}`
+    : `paired ${agoDays(d.created)} · last seen ${agoDays(d.last_seen)}`;
+  const actions = el('div', { class: 'pair-actions' });
+  if (d.status === 'pending') actions.append(...decideButtons(d));
+  else actions.append(el('button', { class: 'danger', onclick: () => revoke(d) }, 'Revoke'));
+  return el('div', { class: 'device' },
+    el('div', { class: 'device-info' },
+      el('div', { class: 'device-name' }, el('span', { class: 'ellipsis' }, d.name), tags),
+      el('span', { class: 'muted device-sub' }, `${d.ip} · ${sub}`)),
+    actions);
+}
+
+async function revoke(d) {
+  const what = d.current ? 'this computer (you will need to pair this browser again)' : d.name;
+  if (!confirm(`Revoke ${what}?`)) return;
+  try {
+    await api(`/api/devices/${enc(d.id)}`, { method: 'DELETE' });
+    if (d.current) return location.reload();
+    toast('Revoked');
+  } catch (e) { toast(e.message, true); }
+  loadDevices();
+}
+
+function openDevices() {
+  const d = $('#devices');
+  if (!d.open) d.showModal();
+  loadDevices();
+}
+
 // ---------------------------------------------------------------- live sync
 
 function setOnline(ok) {
@@ -541,6 +613,8 @@ async function sync() {
       const d = await r.json();
       setOnline(true);
       if (d.version !== version) { version = d.version; render(d.files); renderNotes(d.notes || []); }
+      if (d.pending) renderPending(d.pending); // only sent to this computer
+      if ($('#devices').open) loadDevices();
     } catch (e) {
       setOnline(false);
       await sleep(2500);
@@ -563,6 +637,11 @@ async function init() {
     k.textContent = `Files and text are deleted automatically after ${info.keepDays} day${info.keepDays > 1 ? 's' : ''}.`;
   }
   if (info.local) {
+    const devBtn = $('#devicesBtn');
+    devBtn.hidden = false;
+    devBtn.onclick = openDevices;
+    $('#devicesClose').onclick = () => $('#devices').close();
+    $('#devices').addEventListener('click', (e) => { if (e.target === $('#devices')) $('#devices').close(); });
     $('#hint').textContent = 'Drop files here, paste images or text with Ctrl+V, or send them from your phone.';
     if (info.folder) {
       const b = $('#openFolder');

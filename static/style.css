@@ -159,3 +159,29 @@ body.locked { min-height: 100dvh; display: flex; align-items: center; justify-co
 body.locked .card { padding: 32px; text-align: center; max-width: 380px; align-items: center; animation: none; }
 body.locked h1 { font-size: 20px; margin: 14px 0 6px; }
 body.locked p { color: var(--muted); margin: 0; }
+
+.pair-banner { display: grid; gap: 8px; margin-bottom: 12px; }
+.pair-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
+  background: rgba(108,140,255,.1); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 12px;
+  animation: pop .25s ease-out; }
+.pair-text { font-weight: 600; overflow-wrap: anywhere; }
+.pair-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.pair-actions > * { padding: 6px 12px; min-height: 34px; font-size: 14px; }
+
+dialog#devices { width: min(560px, calc(100vw - 24px)); max-height: min(80dvh, 640px); padding: 0; color: var(--text);
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+.devices-top { display: flex; justify-content: space-between; align-items: center; padding: 10px 10px 10px 16px;
+  border-bottom: 1px solid var(--line); }
+.device-list { display: grid; padding: 4px 16px 12px; }
+.device { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0;
+  border-bottom: 1px solid var(--line); }
+.device:last-child { border-bottom: 0; }
+.device-info { display: grid; gap: 2px; min-width: 0; }
+.device-name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 600; min-width: 0; }
+.device-sub { font-size: 13px; }
+.tags { display: inline-flex; gap: 6px; }
+.tag { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--panel2);
+  border: 1px solid var(--line); color: var(--muted); }
+.tag.warn { color: #ffcf6b; border-color: rgba(255,207,107,.4); }
+body.locked .pending-name { color: var(--text); font-weight: 600; margin: 4px 0 10px; }
+body.locked .pending-name:empty { display: none; }

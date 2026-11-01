@@ -6,9 +6,10 @@ Two listeners:
   * HTTP on 127.0.0.1 (default :8080) for this computer's browser (localhost is a secure
     context, so clipboard copy works without certificate warnings)
 
-Access requires pairing: scan the QR code printed in the terminal. The pairing secret is new on
-every run and only works for a few minutes after startup. Pairing sets a long-lived HttpOnly
-session cookie. Run with --new-token to revoke every paired device.
+Access requires pairing: scan the QR code printed in the terminal, then click Allow in the panel on
+this computer (--no-confirm skips that). The pairing secret is new on every run and only works for
+a few minutes after startup. Pairing sets a long-lived HttpOnly session cookie. Paired devices can
+be revoked one by one from the panel's Devices dialog, or all at once with --new-token.
 """
 import argparse
 import hashlib
@@ -43,6 +44,8 @@ LONG_POLL_SECONDS = 25
 PAIR_MAX_FAILS = 8
 PAIR_FAIL_WINDOW = 15 * 60
 PAIR_MINUTES = 10
+PENDING_TTL = 15 * 60  # a pairing request nobody approves is dropped after this long
+LAST_SEEN_FLUSH = 60  # write last_seen times to disk at most this often
 
 IMAGE_MIME = {
     "jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp",
@@ -73,6 +76,7 @@ STATIC_FILES = {
     "app.js": "text/javascript; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
     "icon.svg": "image/svg+xml",
+    "pending.js": "text/javascript; charset=utf-8",
 }
 CLIP_KEEP = 30  # PNG clipboard copies kept for this many most-recently-used images
 THUMB_SIZES = (480, 1600)  # grid, and the viewer for formats browsers can't display (HEIC/TIFF)
@@ -370,6 +374,19 @@ def lan_ips():
     return sorted(ip for ip in ips if not ipaddress.ip_address(ip).is_loopback)
 
 
+def device_name(ua: str) -> str:
+    """A short label like "iPhone · Safari" for the device panel and pairing prompts."""
+    device = next((label for needle, label in (
+        ("iPad", "iPad"), ("iPhone", "iPhone"), ("Android", "Android"), ("CrOS", "ChromeOS"),
+        ("Macintosh", "Mac"), ("Windows", "Windows"), ("Linux", "Linux")) if needle in ua), None)
+    # Order matters: Edge and Brave also say Chrome, and Chrome also says Safari.
+    browser = next((label for needles, label in (
+        (("Edg/", "EdgA/", "EdgiOS/"), "Edge"), (("Brave",), "Brave"), (("Firefox/", "FxiOS/"), "Firefox"),
+        (("Chrome/", "CriOS/", "Chromium/"), "Chrome"), (("Safari/",), "Safari"))
+        if any(n in ua for n in needles)), None)
+    return " · ".join(x for x in (device, browser) if x) or "Unknown device"
+
+
 def primary_ip():
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -383,8 +400,9 @@ def primary_ip():
 
 class State:
     def __init__(self, store: Path, max_bytes: int, new_token: bool, pair_minutes: int, keep_metadata=False,
-                 keep_days=0):
+                 keep_days=0, no_confirm=False):
         self.store = store
+        self.no_confirm = no_confirm
         self.keep_metadata = keep_metadata
         self.keep_days = keep_days
         self.partial = store / ".partial"
@@ -422,12 +440,37 @@ class State:
         # One-time, loopback-only code for auto-opening this PC's browser, so the phone token
         # doesn't end up in the desktop browser's history.
         self.local_code = secrets.token_urlsafe(32)
+        self.sessions_tick = 0  # bumped on every add/approve/deny/revoke, wakes the PC's long-poll
+        self.sessions_saved = 0.0
+        self.sessions_dirty = False  # last_seen changed since the last write
         try:
-            self.sessions = json.loads(self.sessions_file.read_text())
+            raw = json.loads(self.sessions_file.read_text())
         except (OSError, ValueError):
-            self.sessions = {}
+            raw = {}
         now = time.time()
-        self.sessions = {k: v for k, v in self.sessions.items() if v.get("expires", 0) > now}
+        self.sessions = {}
+        migrated = False
+        for k, v in (raw.items() if isinstance(raw, dict) else ()):
+            if not isinstance(v, dict) or not isinstance(v.get("expires"), (int, float)) or v["expires"] <= now:
+                migrated = True
+                continue
+            if "id" not in v:
+                v, migrated = self._migrate(v, now), True
+            self.sessions[k] = v
+        if migrated:
+            with self.lock:
+                self._save_sessions()
+
+    @staticmethod
+    def _migrate(old: dict, now: float) -> dict:
+        """Older versions stored only expires/ip/ua and a "created" date string."""
+        try:
+            created = time.mktime(time.strptime(old.get("created", ""), "%Y-%m-%d %H:%M:%S"))
+        except (TypeError, ValueError, OverflowError):
+            created = now
+        return {"id": secrets.token_urlsafe(6), "role": "device", "status": "active",
+                "name": device_name(old.get("ua", "")), "ip": old.get("ip", ""), "created": created,
+                "last_seen": now, "expires": old["expires"]}
 
     @staticmethod
     def _write_private(path: Path, text: str):
@@ -442,24 +485,115 @@ class State:
     def _h(sid: str) -> str:
         return hashlib.sha256(sid.encode()).hexdigest()
 
-    def new_session(self, ip: str, ua: str) -> str:
+    # ---- sessions (paired devices)
+
+    def _save_sessions(self, structural=True):
+        """Write sessions.json. Call with self.lock held."""
+        self._write_private(self.sessions_file, json.dumps(self.sessions, indent=1))
+        self.sessions_saved, self.sessions_dirty = time.time(), False
+        if structural:
+            self.sessions_tick += 1
+
+    def new_session(self, ip: str, ua: str, status="active") -> tuple:
         sid = secrets.token_urlsafe(32)
+        now = time.time()
+        rec = {"id": secrets.token_urlsafe(6), "role": "device", "status": status, "name": device_name(ua),
+               "ip": ip, "created": now, "last_seen": now,
+               "expires": now + (SESSION_TTL if status == "active" else PENDING_TTL)}
         with self.lock:
-            self.sessions[self._h(sid)] = {"expires": time.time() + SESSION_TTL, "ip": ip, "ua": ua[:200],
-                                           "created": time.strftime("%Y-%m-%d %H:%M:%S")}
-            self._write_private(self.sessions_file, json.dumps(self.sessions, indent=1))
-        return sid
+            self.sessions[self._h(sid)] = rec
+            self._save_sessions()
+        return sid, rec
+
+    def session_for(self, sid: str):
+        """The session record for a cookie, whatever its status, or None."""
+        if not sid:
+            return None
+        s = self.sessions.get(self._h(sid))
+        return s if s and s["expires"] > time.time() else None
 
     def valid_session(self, sid: str) -> bool:
-        if not sid:
-            return False
-        s = self.sessions.get(self._h(sid))
-        return bool(s and s["expires"] > time.time())
+        s = self.session_for(sid)
+        return bool(s and s.get("status") == "active")
+
+    def touch_session(self, sid: str):
+        """Note that the session was just used. Written to disk at most once a minute."""
+        s = self.session_for(sid)
+        if not s:
+            return
+        s["last_seen"] = time.time()
+        self.sessions_dirty = True
+        if time.time() - self.sessions_saved >= LAST_SEEN_FLUSH:
+            self.flush_sessions()
+
+    def flush_sessions(self):
+        with self.lock:
+            if self.sessions_dirty:
+                self._save_sessions(structural=False)
+
+    def prune_sessions(self):
+        """Drop expired sessions, including pairing requests nobody approved."""
+        now = time.time()
+        with self.lock:
+            dead = [k for k, v in self.sessions.items() if v["expires"] <= now]
+            for k in dead:
+                del self.sessions[k]
+            if dead:
+                self._save_sessions()
+
+    def sessions_forever(self):
+        while True:
+            time.sleep(LAST_SEEN_FLUSH)
+            try:
+                self.prune_sessions()
+                self.flush_sessions()
+            except Exception as e:  # keep the sweeper alive
+                sys.stderr.write(f"session sweep failed: {e}\n")
 
     def drop_session(self, sid: str):
         with self.lock:
             if self.sessions.pop(self._h(sid), None) is not None:
-                self._write_private(self.sessions_file, json.dumps(self.sessions, indent=1))
+                self._save_sessions()
+
+    def _key_for(self, did: str):
+        return next((k for k, v in self.sessions.items() if v["id"] == did), None)
+
+    def approve_device(self, did: str):
+        """Let a pending device in. Returns its record, or None if there is no such request."""
+        with self.lock:
+            k = self._key_for(did)
+            if not k or self.sessions[k]["expires"] <= time.time():
+                return None
+            rec = self.sessions[k]
+            rec.update(status="active", expires=time.time() + SESSION_TTL)
+            self._save_sessions()
+        return rec
+
+    def remove_device(self, did: str):
+        """Deny a pairing request or revoke a paired device. Returns the removed record or None."""
+        with self.lock:
+            k = self._key_for(did)
+            if not k:
+                return None
+            rec = self.sessions.pop(k)
+            self._save_sessions()
+        return rec
+
+    def pending_devices(self):
+        self.prune_sessions()
+        with self.lock:  # the sweeper thread may delete entries while we iterate
+            recs = sorted(self.sessions.values(), key=lambda v: v["created"])
+        return [{k: v[k] for k in ("id", "name", "ip", "created")} for v in recs if v["status"] == "pending"]
+
+    def devices(self, current_sid: str):
+        self.prune_sessions()
+        me = self._h(current_sid) if current_sid else None
+        with self.lock:
+            items = list(self.sessions.items())
+        out = [{**{k: v.get(k) for k in ("id", "name", "ip", "created", "last_seen", "expires", "role", "status")},
+                "current": k == me} for k, v in items]
+        out.sort(key=lambda d: d["created"], reverse=True)
+        return out
 
     def pair_blocked(self, ip: str) -> bool:
         with self.lock:
@@ -481,19 +615,20 @@ class State:
     def pairing_open(self) -> bool:
         return self.pair_until is None or time.time() < self.pair_until
 
-    def check_token(self, t: str, local: bool) -> bool:
+    def check_token(self, t: str, local: bool):
+        """Which secret the pairing link carried: "local" (this PC's one-time code), "phone", or None."""
         t = t.encode()
         with self.lock:
             if local and self.local_code and hmac.compare_digest(t, self.local_code.encode()):
                 self.local_code = None
-                return True
-        return self.pairing_open() and hmac.compare_digest(t, self.token.encode())
+                return "local"
+        return "phone" if self.pairing_open() and hmac.compare_digest(t, self.token.encode()) else None
 
     # ---- files
 
     def version(self) -> str:
         tick = self.clipper.tick if self.clipper else 0
-        return f"{self.store.stat().st_mtime_ns}.{tick}.{self.notes_tick}"
+        return f"{self.store.stat().st_mtime_ns}.{tick}.{self.notes_tick}.{self.sessions_tick}"
 
     # ---- notes (text and links shared between devices)
 
@@ -838,6 +973,7 @@ class Handler(BaseHTTPRequestHandler):
 
     state: State = None
     allowed_hosts: set = set()
+    local_port = 8080  # for the "approve it in the panel" hint
 
     # ---- helpers
 
@@ -904,7 +1040,11 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def authed(self):
-        return self.state.valid_session(self.cookie(SESSION_COOKIE))
+        sid = self.cookie(SESSION_COOKIE)
+        if not self.state.valid_session(sid):
+            return False
+        self.state.touch_session(sid)
+        return True
 
     def host_ok(self):
         # Rejecting unknown Host headers defeats DNS-rebinding attacks from malicious websites.
@@ -946,8 +1086,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/manifest.webmanifest":
                 return self.send_static(STATIC_DIR / "manifest.webmanifest", "application/manifest+json")
             if path == "/":
-                page = "index.html" if self.authed() else "locked.html"
+                s = self.state.session_for(self.cookie(SESSION_COOKIE))
+                page = "locked.html" if not s else "pending.html" if s["status"] == "pending" else "index.html"
+                if page == "index.html":
+                    self.authed()  # updates last_seen
                 return self.send_static(STATIC_DIR / page, "text/html; charset=utf-8", "no-store")
+            if path == "/api/pair-status":  # the only endpoint a device waiting for approval can reach
+                s = self.state.session_for(self.cookie(SESSION_COOKIE))
+                if not s:
+                    return self.error(404, "No pairing request")
+                return self.send_json({"status": s["status"], "name": s["name"]})
 
         if not self.authed():
             return self.error(401, "Not paired", close=method != "GET")
@@ -955,6 +1103,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(403, "Cross-site request blocked", close=True)
 
         name = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+        if path == "/api/devices" or path.startswith("/api/devices/"):
+            return self.do_devices(method, path)
         if method == "GET":
             if path == "/api/info":
                 return self.send_json({"local": self.is_local, "maxBytes": self.state.max_bytes,
@@ -1012,16 +1162,27 @@ class Handler(BaseHTTPRequestHandler):
         ip = self.client_address[0]
         if self.state.pair_blocked(ip):
             return self.error(429, "Too many failed attempts. Try again later.")
-        if not token or not self.state.check_token(token, self.is_local):
+        kind = self.state.check_token(token, self.is_local) if token else None
+        if not kind:
             self.state.pair_failed(ip)
             return self.error(403, "Invalid or expired pairing link. Restart PhoneDrop on the computer "
                                    "and scan the new QR code.")
         self.state.pair_succeeded(ip)
-        sid = self.state.new_session(ip, self.headers.get("User-Agent", ""))
+        old = self.cookie(SESSION_COOKIE)
+        if old:  # scanning again replaces this browser's previous session instead of piling up records
+            self.state.drop_session(old)
+        # The PC's own one-time code proves it is this computer; a scanned QR needs approval on the PC.
+        status = "active" if kind == "local" or self.state.no_confirm else "pending"
+        sid, rec = self.state.new_session(ip, self.headers.get("User-Agent", ""), status)
         cookie = f"{SESSION_COOKIE}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
         if self.is_tls:
             cookie += "; Secure"
-        self.log_message("paired new device: %s", self.headers.get("User-Agent", "?")[:80])
+        if status == "pending":
+            msg = f"{rec['name']} ({ip}) wants to pair"
+            self.log_message("%s — approve it in the panel: http://127.0.0.1:%d", msg, self.local_port)
+            notify(msg)
+        else:
+            self.log_message("paired new device: %s", rec["name"])
         # Redirect strips the token from the address bar / history.
         self.send_common(303, "text/plain", 0, {"Location": "/", "Set-Cookie": cookie, "Cache-Control": "no-store"})
 
@@ -1031,7 +1192,35 @@ class Handler(BaseHTTPRequestHandler):
             deadline = time.time() + LONG_POLL_SECONDS
             while st.version() == wait and time.time() < deadline:
                 time.sleep(0.4)
-        self.send_json({"version": st.version(), "files": st.listing(), "notes": list(reversed(st.notes))})
+        body = {"version": st.version(), "files": st.listing(), "notes": list(reversed(st.notes))}
+        if self.is_local:
+            body["pending"] = st.pending_devices()
+        self.send_json(body)
+
+    def do_devices(self, method, path):
+        """Device panel: list, approve/deny pairing requests, revoke. Only from this computer."""
+        if not self.is_local:
+            return self.error(403, "Only available on this computer", close=method != "GET")
+        st = self.state
+        if method == "GET" and path == "/api/devices":
+            return self.send_json({"devices": st.devices(self.cookie(SESSION_COOKIE))})
+        m = re.fullmatch(r"/api/devices/([\w-]{1,32})(?:/(approve|deny))?", path)
+        if not m:
+            return self.error(404, "Not found", close=method != "GET")
+        did, action = m.groups()
+        if method == "POST" and action == "approve":
+            rec = st.approve_device(did)
+            if not rec:
+                return self.error(404, "No such pairing request (it may have expired)")
+            self.log_message("approved %s (%s)", rec["name"], rec["ip"])
+            return self.send_json({"ok": True})
+        if (method == "POST" and action == "deny") or (method == "DELETE" and not action):
+            rec = st.remove_device(did)
+            if not rec:
+                return self.error(404, "No such device")
+            self.log_message("%s %s (%s)", "denied" if action else "revoked", rec["name"], rec["ip"])
+            return self.send_json({"ok": True})
+        return self.error(404, "Not found", close=method != "GET")
 
     def do_file(self, name, download):
         p = self.state.resolve(name)
@@ -1306,6 +1495,18 @@ def cert_fingerprint(cert: Path) -> str:
     return ":".join(h[i:i + 2] for i in range(0, len(h), 2))
 
 
+def notify(msg: str):
+    """Desktop notification, if notify-send is available. Never blocks the request."""
+    if not shutil.which("notify-send"):
+        return
+    try:
+        proc = subprocess.Popen(["notify-send", "-a", "PhoneDrop", "PhoneDrop", msg], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        threading.Thread(target=proc.wait, daemon=True).start()  # reap it, so no zombie is left behind
+    except OSError:
+        pass
+
+
 def print_qr(url):
     if shutil.which("qrencode"):
         subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", url])
@@ -1331,12 +1532,14 @@ def main():
                     help="delete received files and notes after this many days (default 0 = keep forever)")
     ap.add_argument("--keep-metadata", action="store_true",
                     help="don't strip EXIF/XMP metadata (GPS location, phone model…) from received images")
+    ap.add_argument("--no-confirm", action="store_true", help="pair devices without approval on the PC")
     ap.add_argument("--new-token", action="store_true", help="unpair all devices")
     ap.add_argument("--no-browser", action="store_true", help="don't open the panel in your browser")
     args = ap.parse_args()
 
     state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token,
-                  args.pair_minutes, args.keep_metadata, max(0, args.keep_days))
+                  args.pair_minutes, args.keep_metadata, max(0, args.keep_days), args.no_confirm)
+    threading.Thread(target=state.sessions_forever, daemon=True).start()
     if state.keep_days:
         threading.Thread(target=state.cleanup_forever, daemon=True).start()
     if shutil.which("wl-copy") and (shutil.which("vips") or shutil.which("magick")):
@@ -1353,6 +1556,7 @@ def main():
     hosts |= {f"{a}:{args.port}" for a in ips}
     Handler.state = state
     Handler.allowed_hosts = hosts
+    Handler.local_port = args.local_port
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -1378,7 +1582,10 @@ def main():
     print("\n  Scan with your phone camera to pair (your browser will warn about the")
     print("  self-signed certificate once — check the fingerprint above and continue):\n")
     print_qr(phone_url)
-    print("  Keep this QR private: anyone who scans it can upload to and read from the panel.")
+    print("  Keep this QR private: anyone who scans it can upload to and read from the panel"
+          + ("." if state.no_confirm else " once you approve them."))
+    if not state.no_confirm:
+        print(f"  New devices must be approved in the panel on this computer (http://127.0.0.1:{args.local_port}).")
     if state.pair_until:
         print(f"  Pairing is open until {time.strftime('%H:%M', time.localtime(state.pair_until))}; "
               "restart PhoneDrop to pair another device later.")
@@ -1394,6 +1601,7 @@ def main():
         threading.Event().wait()
     except KeyboardInterrupt:
         print("\nStopping.")
+        state.flush_sessions()
         lan.shutdown()
         local.shutdown()
 

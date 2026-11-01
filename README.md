@@ -14,7 +14,10 @@ python3 phonedrop.py
 1. A QR code appears in the terminal and the panel opens in your browser.
 2. Within 10 minutes, scan the QR with your phone (same Wi-Fi). Accept the self-signed certificate
    warning once (compare the SHA-256 fingerprint printed in the terminal if you want to be sure).
-   Paired devices stay paired for 30 days; to pair a new one later, restart PhoneDrop.
+   The phone then waits for approval: the panel on the computer shows "iPhone · Safari (…) wants
+   to pair" (plus a desktop notification if `notify-send` is installed); click **Allow**.
+   Paired devices stay paired for 30 days; to pair a new one later, restart PhoneDrop. **Devices**
+   in the panel's header lists every paired device and lets you revoke them one by one.
 3. Tap **Send photos & videos** (or **Send files** for PDFs, documents, archives…). They show up
    live on the computer, saved to `~/Pictures/PhoneDrop`. Videos and audio play in the panel.
    Going the other way, **Share** on the phone opens its share sheet, where you can save to the
@@ -47,6 +50,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 | `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
 | `--keep-metadata` | | don't strip EXIF/XMP metadata from received images |
 | `--keep-days` | 0 | delete received files and notes after this many days (0 = keep forever) |
+| `--no-confirm` | | pair devices without approval on the PC |
 | `--new-token` | | unpairs every device |
 | `--no-browser` | | don't auto-open the panel |
 
@@ -57,6 +61,10 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   history is useless. The PC's browser pairs with a separate one-time code that only works from
   this computer. Pairing sets a 30-day HttpOnly session cookie; session IDs are stored hashed in
   `~/.config/phonedrop/` (mode 0700).
+- **Approval on the PC**: scanning the QR alone isn't enough. A new device only gets a "waiting
+  for approval" page until you click **Allow** in the panel on this computer; requests nobody
+  approves expire after 15 minutes. The **Devices** dialog (this computer only) shows every paired
+  device with its IP and when it was last seen, and **Revoke** cuts one off immediately.
 - **LAN only by default**: the phone port listens on your LAN address, not on every interface
   (VPNs, Docker networks, public IPs). PhoneDrop warns you if that address isn't a private one.
 - **Encrypted on the LAN**: TLS 1.2+ with an auto-generated ECDSA certificate. The PC uses plain HTTP,
@@ -79,7 +87,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   the terminal log says which.
   Use `--keep-metadata` to turn this off.
 - **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer, and image files are served sandboxed.
-- Clipboard copy and "Open folder" work only from this computer.
+- Clipboard copy, "Open folder" and device management work only from this computer.
 
 ### Know this before you use it
 
@@ -89,8 +97,8 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   shown on your phone with the one printed in the terminal rules this out.
 - **A paired device has full access**: it can see, download, upload and delete every image in the
   PhoneDrop folder. Only pair your own devices, and don't show the QR code to anyone (or in a
-  screenshot or stream) while the pairing window is open. Run with `--new-token` if a paired
-  device is lost.
+  screenshot or stream) while the pairing window is open, and only approve requests you expect.
+  Revoke a lost device under **Devices**, or run with `--new-token` to unpair everything.
 - **Images are processed by ImageMagick / libvips** (previews and clipboard conversion). Bugs in
   image decoders have been exploited before, so keep them updated. Only paired devices can upload.
 - **Don't expose it to the internet**: no port forwarding, and don't use `--bind 0.0.0.0` on a
