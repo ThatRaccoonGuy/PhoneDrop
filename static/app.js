@@ -198,7 +198,10 @@ function render(list) {
     const cur = $('#viewerName').textContent;
     const idx = files.findIndex((f) => f.name === cur);
     idx < 0 ? $('#viewer').close() : (viewerIndex = idx);
-    if (idx >= 0) applyCopyButton($('#viewerCopy'), files[idx]);
+    if (idx >= 0) {
+      applyCopyButton($('#viewerCopy'), files[idx]);
+      applyHash(files[idx]);
+    }
   }
 }
 
@@ -512,12 +515,29 @@ function showViewer() {
     file.querySelector('.viewer-size').textContent = human(f.size);
   }
   applyCopyButton($('#viewerCopy'), f);
+  applyHash(f);
   if (canShareFiles() && f.size <= SHARE_CACHE_MAX) fetchForShare(f).catch(() => {}); // so Share is instant
   const open = $('#viewerOpen');
   open.hidden = isImage(f) || f.kind === 'file';
   open.href = f.url;
   $('#viewerDl').href = `/f/${enc(f.name)}?dl=1`;
   $('#viewerDl').setAttribute('download', f.name);
+}
+
+// The server hashes files in the background; until it's done the button says so.
+function applyHash(f) {
+  const b = $('#viewerHash');
+  b.disabled = !f.sha256;
+  b.textContent = f.sha256 ? `SHA-256 ${f.sha256.slice(0, 8)}…${f.sha256.slice(-4)}` : 'SHA-256 computing…';
+  b.title = f.sha256 ? `${f.sha256}\nClick to copy` : '';
+}
+
+async function copyHash(f) {
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('Clipboard not supported in this browser');
+    await navigator.clipboard.writeText(f.sha256);
+    toast('Hash copied');
+  } catch (e) { toast(`Copy failed: ${e.message}`, true); }
 }
 
 function step(d) {
@@ -766,6 +786,7 @@ async function init() {
   $('#viewerCopy').onclick = () => copyImage(files[viewerIndex]);
   $('#viewerShare').onclick = () => shareFile(files[viewerIndex]);
   $('#viewerDel').onclick = () => remove(files[viewerIndex]);
+  $('#viewerHash').onclick = () => files[viewerIndex]?.sha256 && copyHash(files[viewerIndex]);
   viewer.addEventListener('click', (e) => { if (e.target === viewer) viewer.close(); });
   document.addEventListener('keydown', (e) => {
     if (!viewer.open) return;
