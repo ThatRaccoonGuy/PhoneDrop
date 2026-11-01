@@ -73,12 +73,17 @@ is shown when a device asks to pair and when a guest link is used.
 
 ## Guest drop links
 
-`POST /api/guest` (loopback) creates an in-memory one-time token valid for 10 minutes and returns
-`{url, expires}`; the panel shows it as text and as a QR (`GET /api/guest/qr` → PNG from
-`qrencode`, or nothing if it isn't installed). Visiting `/g?t=<token>` consumes the token and
-creates a `guest` session valid for `--guest-minutes` (default 30). Guests get `guest.html`: an
-upload button, a progress list, nothing else. Guest uploads are saved with a `guest-` prefix and
-logged. Guests appear in the device panel and can be revoked like any device.
+`POST /api/guest` (loopback) creates an in-memory one-time token valid for 10 minutes (any older
+link stops working) and returns `{url, expires, qr}`; the panel shows the URL as text and `qr` as an
+image (a `data:image/png` URL from `qrencode`, or `null` if it isn't installed). `DELETE /api/guest`
+revokes the link. Visiting `/g?t=<token>` goes through the pairing brute-force limiter, consumes the
+token and creates a `guest` session valid for `--guest-minutes` (default 30); a browser that is
+already a paired device keeps its session and leaves the token unused. Guests get `guest.html` +
+`guest.js` (app.js is never loaded): upload buttons, a progress list, the names they sent, nothing
+else. After the auth gate a guest can reach only `GET /api/info` (`{guest, name, maxBytes,
+expires}`) and `POST /api/upload`; everything else is 403. Guest uploads are saved with a `guest-`
+prefix and logged with the guest's name. Guests appear in the device panel and can be revoked like
+any device; once the session ends, the page's next request gets 401 and it says so.
 
 ## Certificates
 

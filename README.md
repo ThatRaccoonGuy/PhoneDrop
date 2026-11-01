@@ -29,6 +29,11 @@ python3 phonedrop.py
 5. **Text and links** work the same way: paste a link or some text into the box on either device
    and it shows up on the other one with **Copy** and **Open** buttons. On the computer, pressing
    Ctrl+V anywhere on the page sends whatever text is on the clipboard.
+6. **Guest links** let someone who isn't paired send you files (a friend's photos, say) without
+   pairing their phone. Click **Guest link** in the panel's header, then **Create link**, and let
+   them scan the QR code (or send them the link). The link works once, within 10 minutes; whoever
+   opens it gets a page that can only upload, for 30 minutes (`--guest-minutes`). Their files are
+   saved with a `guest-` prefix, and they show up under **Devices**, where you can revoke them early.
 
 If you run a firewall, allow the phone port from your local network only. For example, with UFW
 (replace `192.168.0.0/24` with your network's range):
@@ -50,6 +55,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 | `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
 | `--keep-metadata` | | don't strip EXIF/XMP metadata from received images |
 | `--keep-days` | 0 | delete received files and notes after this many days (0 = keep forever) |
+| `--guest-minutes` | 30 | how long someone who opened a guest link can upload |
 | `--no-confirm` | | pair devices without approval on the PC |
 | `--new-token` | | unpairs every device |
 | `--no-browser` | | don't auto-open the panel |
@@ -69,7 +75,12 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   (VPNs, Docker networks, public IPs). PhoneDrop warns you if that address isn't a private one.
 - **Encrypted on the LAN**: TLS 1.2+ with an auto-generated ECDSA certificate. The PC uses plain HTTP,
   but only on 127.0.0.1.
-- **Brute-force lockout**: 8 bad pairing attempts per IP → 15-minute block.
+- **Guest links are single use and upload-only**: a random 192-bit token, kept in memory only, valid
+  for 10 minutes and used up by the first visit (making a new link or clicking **Revoke link**
+  cancels the old one). A guest can only upload; it can't list, download or delete anything, read
+  the shared text, or see where files are stored. Its session ends after `--guest-minutes`, or as
+  soon as you revoke it under **Devices**. Links can only be made from this computer.
+- **Brute-force lockout**: 8 bad pairing or guest-link attempts per IP → 15-minute block.
 - **CSRF / DNS rebinding**: changes need a custom header plus a matching Origin, and requests with
   an unknown `Host` header are rejected.
 - **Upload validation**: the type is checked from the file's content, not its name. Accepted:
@@ -99,8 +110,10 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   PhoneDrop folder. Only pair your own devices, and don't show the QR code to anyone (or in a
   screenshot or stream) while the pairing window is open, and only approve requests you expect.
   Revoke a lost device under **Devices**, or run with `--new-token` to unpair everything.
+  Guests (people you sent a guest link) are different: they can only upload, and only for a while.
 - **Images are processed by ImageMagick / libvips** (previews and clipboard conversion). Bugs in
-  image decoders have been exploited before, so keep them updated. Only paired devices can upload.
+  image decoders have been exploited before, so keep them updated. Only paired devices and guests
+  you sent a link to can upload.
 - **Don't expose it to the internet**: no port forwarding, and don't use `--bind 0.0.0.0` on a
   machine with a public IP. It's built for a local network.
 - **The PC side is plain HTTP on 127.0.0.1**, which never leaves your computer. Other user accounts

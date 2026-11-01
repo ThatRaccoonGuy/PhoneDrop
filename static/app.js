@@ -570,6 +570,7 @@ function deviceRow(d) {
   if (d.status === 'pending') tags.append(el('span', { class: 'tag warn' }, 'waiting for approval'));
   if (d.role === 'guest') tags.append(el('span', { class: 'tag' }, 'guest'));
   const sub = d.status === 'pending' ? `asked ${ago(d.created)}`
+    : d.role === 'guest' ? `arrived ${ago(d.created)} · can upload until ${clock(d.expires)}`
     : `paired ${agoDays(d.created)} · last seen ${agoDays(d.last_seen)}`;
   const actions = el('div', { class: 'pair-actions' });
   if (d.status === 'pending') actions.append(...decideButtons(d));
@@ -596,6 +597,61 @@ function openDevices() {
   const d = $('#devices');
   if (!d.open) d.showModal();
   loadDevices();
+}
+
+// ---------------------------------------------------------------- guest link (this computer only)
+
+const clock = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+function showGuestLink(link) {
+  $('#guestLink').hidden = !link;
+  $('#guestCreate').textContent = link ? 'New link' : 'Create link';
+  if (!link) return;
+  const qr = $('#guestQr');
+  qr.hidden = !link.qr;
+  if (link.qr) qr.src = link.qr; else qr.removeAttribute('src');
+  $('#guestUrl').value = link.url;
+  $('#guestExpires').textContent = `Works once, until ${clock(link.expires)}.` + (link.qr ? '' : ' (Install qrencode to get a QR code here.)');
+}
+
+async function createGuestLink() {
+  try {
+    showGuestLink(await (await api('/api/guest', { method: 'POST' })).json());
+  } catch (e) { toast(e.message, true); }
+}
+
+async function revokeGuestLink() {
+  try {
+    await api('/api/guest', { method: 'DELETE' });
+    showGuestLink(null);
+    toast('Guest link revoked');
+  } catch (e) { toast(e.message, true); }
+}
+
+async function copyGuestLink() {
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('Clipboard not supported in this browser');
+    await navigator.clipboard.writeText($('#guestUrl').value);
+    toast('Link copied');
+  } catch (e) { toast(`Copy failed: ${e.message}`, true); }
+}
+
+function setupGuest() {
+  const d = $('#guest');
+  const btn = $('#guestBtn');
+  btn.hidden = false;
+  btn.onclick = () => { if (!d.open) d.showModal(); };
+  const mins = info.guestMinutes;
+  if (mins) {
+    $('#guestExplain').textContent = 'Let someone who isn\'t paired send you files. The link is upload-only and works ' +
+      `once, within 10 minutes; after they open it they can upload for ${mins} minute${mins > 1 ? 's' : ''}.`;
+  }
+  $('#guestClose').onclick = () => d.close();
+  d.addEventListener('click', (e) => { if (e.target === d) d.close(); });
+  $('#guestCreate').onclick = createGuestLink;
+  $('#guestCopy').onclick = copyGuestLink;
+  $('#guestRevoke').onclick = revokeGuestLink;
+  $('#guestUrl').addEventListener('focus', (e) => e.target.select());
 }
 
 // ---------------------------------------------------------------- live sync
@@ -642,6 +698,7 @@ async function init() {
     devBtn.onclick = openDevices;
     $('#devicesClose').onclick = () => $('#devices').close();
     $('#devices').addEventListener('click', (e) => { if (e.target === $('#devices')) $('#devices').close(); });
+    setupGuest();
     $('#hint').textContent = 'Drop files here, paste images or text with Ctrl+V, or send them from your phone.';
     if (info.folder) {
       const b = $('#openFolder');
