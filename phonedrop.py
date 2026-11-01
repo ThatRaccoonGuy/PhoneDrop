@@ -53,6 +53,14 @@ PENDING_TTL = 15 * 60  # a pairing request nobody approves is dropped after this
 LAST_SEEN_FLUSH = 60  # write last_seen times to disk at most this often
 GUEST_LINK_TTL = 10 * 60  # an unused guest link stops working after this long
 GUEST_MINUTES = 30
+LOCAL_CODE_TTL = 120  # the PC's one-time pairing code (opened in its browser) stops working after this long
+PENDING_MAX_PER_IP = 3  # pairing requests waiting for approval, per IP and in total
+PENDING_MAX = 10
+MAX_CONNECTIONS = 64  # open connections per listener; more are closed at once
+MAX_CONNECTIONS_PER_IP = 16  # browsers open about 6 per host, so this only stops floods
+HEADER_TIMEOUT = 20  # seconds a client may stay silent before its request headers are complete
+BODY_TIMEOUT = 60  # seconds a client may stay silent while sending a body
+DISK_RESERVE = 256 * 1024 * 1024  # free space always left on the disk
 
 IMAGE_MIME = {
     "jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp",
@@ -69,6 +77,10 @@ TEXT_EXTS = {"txt", "md", "csv", "json", "log", "srt", "ics", "vcf"}
 MIME = {**IMAGE_MIME, **VIDEO_MIME, **AUDIO_MIME, "pdf": "application/pdf",
         **{e: "application/octet-stream" for e in FILE_EXTS if e != "pdf"}}
 SNIFF_BYTES = 1024
+# ImageMagick picks a decoder from the file's content unless told otherwise; pinning it to the type we
+# sniffed keeps a file from reaching coders (MVG, MSL, SVG, PS…) that were never meant to see uploads.
+CODER = {"jpg": "JPEG", "png": "PNG", "gif": "GIF", "webp": "WEBP", "heic": "HEIC", "avif": "AVIF",
+         "bmp": "BMP", "tiff": "TIFF", "pdf": "PDF"}
 
 
 def kind_of(ext: str) -> str:
@@ -114,7 +126,8 @@ def sniff_image(head: bytes):
             return "avif"
         if any(b in brands for b in (b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1")):
             return "heic"
-    if head.startswith(b"BM") and len(head) > 14:
+    if (head.startswith(b"BM") and len(head) >= 26
+            and int.from_bytes(head[14:18], "little") in (12, 40, 52, 56, 108, 124)):  # known DIB headers
         return "bmp"
     if head[:4] in (b"II*\x00", b"MM\x00*"):
         return "tiff"
@@ -181,7 +194,7 @@ def strip_video(path: Path, ext: str) -> bool:
     fmt = {"mov": "mov", "3gp": "3gp"}.get(ext, "mp4")
     tmp = path.with_name(path.name + ".strip")
     try:
-        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-map", "0", "-map_metadata", "-1",
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-protocol_whitelist", "file", "-i", str(path), "-map", "0", "-map_metadata", "-1",
                             "-c", "copy", "-movflags", "+faststart", "-f", fmt, str(tmp)],
                            capture_output=True, timeout=600)
         if r.returncode or not tmp.exists() or not tmp.stat().st_size:
@@ -254,7 +267,30 @@ def _copy_until(src, dst, end_marker: bytes, chunk=1024 * 1024):
         carry = data[-1:]
 
 
+def _copy_exact(src, dst, n: int, chunk=1024 * 1024):
+    """Copy exactly n bytes from src to dst, in pieces."""
+    while n > 0:
+        buf = src.read(min(n, chunk))
+        if not buf:
+            raise ValueError("truncated")
+        dst.write(buf)
+        n -= len(buf)
+
+
+def _skip_fill(src, chunk=64 * 1024) -> int:
+    """Skip a run of 0xFF fill bytes in bulk; returns the marker byte that follows it."""
+    while True:
+        buf = src.read(chunk)
+        if not buf:
+            raise ValueError("truncated")
+        rest = buf.lstrip(b"\xff")
+        if rest:
+            src.seek(1 - len(rest), 1)  # leave the file just after the marker byte
+            return rest[0]
+
+
 def strip_jpeg(src, dst):
+    size = os.fstat(src.fileno()).st_size
     if src.read(2) != b"\xff\xd8":
         raise ValueError("not a JPEG")
     dst.write(b"\xff\xd8")
@@ -265,15 +301,20 @@ def strip_jpeg(src, dst):
             raise ValueError("bad segment")
         kind = marker[1]
         if kind == 0xFF:
-            src.seek(-1, 1)
-            continue
+            kind = _skip_fill(src)
+            marker = bytes((0xFF, kind))
         if kind == 0xDA:  # start of scan: write orientation, then copy the image data up to EOI
             if orientation and orientation != 1:
                 dst.write(minimal_exif(orientation))
             dst.write(marker)
             _copy_until(src, dst, b"\xff\xd9")
             return
-        length = int.from_bytes(src.read(2), "big")
+        raw = src.read(2)
+        length = int.from_bytes(raw, "big")
+        if len(raw) < 2 or length < 2:
+            raise ValueError("bad segment length")
+        if length - 2 > size - src.tell():  # never allocate more than the file can hold
+            raise ValueError("segment runs past the end of the file")
         payload = src.read(length - 2)
         if len(payload) != length - 2:
             raise ValueError("truncated segment")
@@ -288,6 +329,7 @@ PNG_DROP = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
 
 
 def strip_png(src, dst):
+    size = os.fstat(src.fileno()).st_size
     sig = src.read(8)
     if sig != b"\x89PNG\r\n\x1a\n":
         raise ValueError("not a PNG")
@@ -297,6 +339,8 @@ def strip_png(src, dst):
         if len(head) < 8:
             raise ValueError("truncated")
         length = int.from_bytes(head[:4], "big")
+        if length > 2 ** 31 - 1 or length + 4 > size - src.tell():
+            raise ValueError("chunk runs past the end of the file")
         kind = head[4:]
         body = src.read(length + 4)
         if len(body) != length + 4:
@@ -308,27 +352,38 @@ def strip_png(src, dst):
 
 
 def strip_webp(src, dst):
+    """Chunks are streamed through; the RIFF size is patched in at the end."""
+    file_size = os.fstat(src.fileno()).st_size
     head = src.read(12)
     if head[:4] != b"RIFF" or head[8:] != b"WEBP":
         raise ValueError("not a WebP")
-    chunks = []
+    dst.write(b"RIFF\0\0\0\0WEBP")
+    total = 4
     while True:
         h = src.read(8)
         if len(h) < 8:
             break
         size = int.from_bytes(h[4:], "little")
-        body = src.read(size + (size & 1))
-        if len(body) < size:
+        left = file_size - src.tell()
+        if size > left:
             raise ValueError("truncated chunk")
+        n = min(size + (size & 1), left)  # the pad byte may be missing at the very end
         if h[:4] in (b"EXIF", b"XMP "):
+            src.seek(n, 1)
             continue
+        dst.write(h)
         if h[:4] == b"VP8X":
-            body = bytes([body[0] & ~0x0C]) + body[1:]  # clear the EXIF and XMP flags
-        chunks.append(h + body)
-    total = sum(len(c) for c in chunks) + 4
-    dst.write(b"RIFF" + total.to_bytes(4, "little") + b"WEBP")
-    for c in chunks:
-        dst.write(c)
+            if size < 1:
+                raise ValueError("bad VP8X chunk")
+            dst.write(bytes([src.read(1)[0] & ~0x0C]))  # clear the EXIF and XMP flags
+            _copy_exact(src, dst, n - 1)
+        else:
+            _copy_exact(src, dst, n)
+        total += 8 + n
+    if total > 0xFFFFFFFF:
+        raise ValueError("too large for RIFF")
+    dst.seek(4)
+    dst.write(total.to_bytes(4, "little"))
 
 
 def strip_metadata(path: Path, ext: str) -> bool:
@@ -343,7 +398,7 @@ def strip_metadata(path: Path, ext: str) -> bool:
             fn(src, dst)
         os.replace(tmp, path)
         return True
-    except (ValueError, OSError):
+    except Exception:  # a malformed file must never take the request down with it
         tmp.unlink(missing_ok=True)
         return False
 
@@ -432,9 +487,11 @@ class State:
             self.notes = []
         self.lock = threading.Lock()
         self.fails = {}  # ip -> [count, first_ts]
+        self.inflight = 0  # bytes of uploads in progress, so parallel uploads can't overfill the disk
         CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(CONFIG_DIR, 0o700)
         store.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(store, 0o700)
         self.partial.mkdir(exist_ok=True, mode=0o700)
         self.thumbs.mkdir(exist_ok=True, mode=0o700)
         for leftover in self.partial.iterdir():
@@ -452,6 +509,7 @@ class State:
         # One-time, loopback-only code for auto-opening this PC's browser, so the phone token
         # doesn't end up in the desktop browser's history.
         self.local_code = secrets.token_urlsafe(32)
+        self.local_until = time.time() + LOCAL_CODE_TTL
         self.sessions_tick = 0  # bumped on every add/approve/deny/revoke, wakes the PC's long-poll
         self.sessions_saved = 0.0
         self.sessions_dirty = False  # last_seen changed since the last write
@@ -507,6 +565,7 @@ class State:
             self.sessions_tick += 1
 
     def new_session(self, ip: str, ua: str, status="active", role="device", ttl=None) -> tuple:
+        """Returns (sid, record), or (None, None) if too many pairing requests are already waiting."""
         sid = secrets.token_urlsafe(32)
         now = time.time()
         if ttl is None:
@@ -514,6 +573,10 @@ class State:
         rec = {"id": secrets.token_urlsafe(6), "role": role, "status": status, "name": device_name(ua),
                "ip": ip, "created": now, "last_seen": now, "expires": now + ttl}
         with self.lock:
+            if status == "pending":
+                waiting = [v["ip"] for v in self.sessions.values() if v["status"] == "pending" and v["expires"] > now]
+                if len(waiting) >= PENDING_MAX or waiting.count(ip) >= PENDING_MAX_PER_IP:
+                    return None, None
             self.sessions[self._h(sid)] = rec
             self._save_sessions()
         return sid, rec
@@ -575,7 +638,7 @@ class State:
         """Let a pending device in. Returns its record, or None if there is no such request."""
         with self.lock:
             k = self._key_for(did)
-            if not k or self.sessions[k]["expires"] <= time.time():
+            if not k or self.sessions[k]["status"] != "pending" or self.sessions[k]["expires"] <= time.time():
                 return None
             rec = self.sessions[k]
             rec.update(status="active", expires=time.time() + SESSION_TTL)
@@ -632,7 +695,8 @@ class State:
         """Which secret the pairing link carried: "local" (this PC's one-time code), "phone", or None."""
         t = t.encode()
         with self.lock:
-            if local and self.local_code and hmac.compare_digest(t, self.local_code.encode()):
+            if (local and self.local_code and time.time() < self.local_until
+                    and hmac.compare_digest(t, self.local_code.encode())):
                 self.local_code = None
                 return "local"
         return "phone" if self.pairing_open() and hmac.compare_digest(t, self.token.encode()) else None
@@ -770,20 +834,27 @@ class State:
                 return out
             tmp = self.thumbs / f".{secrets.token_hex(6)}.jpg"
             cmds = []
-            kind = kind_of(p.suffix[1:].lower())
+            ext = p.suffix[1:].lower()
+            kind = kind_of(ext)
             if kind == "video" and shutil.which("ffmpeg"):
                 # A frame from one second in (or the first frame for very short clips).
                 for ss in ("1", "0"):
-                    cmds.append(["ffmpeg", "-v", "error", "-y", "-ss", ss, "-i", str(p), "-frames:v", "1",
+                    cmds.append(["ffmpeg", "-v", "error", "-y", "-protocol_whitelist", "file", "-ss", ss, "-i", str(p),
+                                 "-frames:v", "1",
                                  "-vf", f"scale='min({size},iw)':-2", "-q:v", "4", "-f", "image2", str(tmp)])
-            elif kind == "pdf" and shutil.which("magick"):
-                cmds.append(["magick", "-density", "72", f"{p}[0]", "-background", "white", "-alpha", "remove",
-                             "-thumbnail", f"{size}x{size}>", "-quality", "78", "-strip", f"jpg:{tmp}"])
+            elif kind == "pdf":
+                if shutil.which("pdftoppm"):  # poppler only reads PDF; it writes <prefix>.jpg, i.e. tmp
+                    cmds.append(["pdftoppm", "-f", "1", "-l", "1", "-scale-to", str(size), "-jpeg", "-singlefile",
+                                 str(p), str(tmp.with_suffix(""))])
+                if shutil.which("magick"):
+                    cmds.append(["magick", "-density", "72", f"{CODER[ext]}:{p}[0]", "-background", "white",
+                                 "-alpha", "remove", "-thumbnail", f"{size}x{size}>", "-quality", "78", "-strip",
+                                 f"jpg:{tmp}"])
             elif kind == "image":
                 if shutil.which("vipsthumbnail"):
                     cmds.append(["vipsthumbnail", str(p), "-s", f"{size}x{size}", "-o", f"{tmp}[Q=78,strip]"])
                 if shutil.which("magick"):
-                    cmds.append(["magick", f"{p}[0]", "-auto-orient", "-thumbnail", f"{size}x{size}>",
+                    cmds.append(["magick", f"{CODER[ext]}:{p}[0]", "-auto-orient", "-thumbnail", f"{size}x{size}>",
                                  "-quality", "78", "-strip", f"jpg:{tmp}"])
             try:
                 for cmd in cmds:
@@ -957,7 +1028,7 @@ class Clipper:
             if shutil.which("vips") and self._vips(src, tmp):
                 pass
             elif shutil.which("magick"):
-                r = subprocess.run(["magick", f"{src}[0]", "-auto-orient", "-define", "png:compression-level=1",
+                r = subprocess.run(["magick", f"{CODER[src.suffix[1:].lower()]}:{src}[0]", "-auto-orient", "-define", "png:compression-level=1",
                                     f"png:{tmp}"], capture_output=True, timeout=180)
                 if r.returncode:
                     return False
@@ -1103,11 +1174,39 @@ class Hasher:
 
 # ---------------------------------------------------------------- HTTP
 
+# Control characters in a request line (e.g. an ESC sequence) must not reach the terminal as-is.
+CONTROL_CHARS = getattr(BaseHTTPRequestHandler, "_control_char_table", None) or str.maketrans(
+    {c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))})
+TCP_TABLES = ("/proc/net/tcp", "/proc/net/tcp6")
+
+
+def tcp_owner(table: str, local_port: int, remote_port: int, local_ip: str = None):
+    """The uid owning the socket in a /proc/net/tcp listing whose local end is local_ip:local_port and
+    remote port remote_port, or None. Rows are "sl local rem st queues timer retr uid …", addresses are
+    hex addr:port (IPv4 addresses little-endian, e.g. 127.0.0.1 is 0100007F). The address is matched
+    too, so 127.0.0.2:<port> can't be confused with 127.0.0.1:<port>."""
+    want_ip = socket.inet_aton(local_ip)[::-1].hex().upper() if local_ip else None
+    for line in table.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 8 or f[3] == "06":  # TIME_WAIT rows no longer belong to anyone
+            continue
+        try:
+            addr, port = f[1].rsplit(":", 1)
+            if int(port, 16) != local_port or int(f[2].rsplit(":", 1)[1], 16) != remote_port:
+                continue
+            if want_ip and len(addr) == 8 and addr.upper() != want_ip:
+                continue
+            return int(f[7])
+        except (IndexError, ValueError):
+            continue
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "PhoneDrop"
     sys_version = ""
-    timeout = 60  # per-socket-op timeout; guards against slow-loris connections
+    timeout = HEADER_TIMEOUT  # per-socket-op timeout; raised to BODY_TIMEOUT once the headers are in
     # Send each response as a single write with Nagle off. Otherwise headers and body go out as separate
     # small packets and TCP delayed-ACK adds ~40 ms (much more on a phone's Wi-Fi) to every request.
     disable_nagle_algorithm = True
@@ -1118,6 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
     local_port = 8080  # for the "approve it in the panel" hint
     phone_base = ""  # https://<LAN IP>:<port>, for guest links
     ca_der = b""  # root certificate (DER), served at /ca.crt
+    check_uid = True  # False where /proc/net/tcp doesn't exist: loopback alone then counts as local
 
     # ---- helpers
 
@@ -1126,12 +1226,37 @@ class Handler(BaseHTTPRequestHandler):
         return isinstance(self.connection, ssl.SSLSocket)
 
     @property
-    def is_local(self):
+    def is_loopback(self):
         return ipaddress.ip_address(self.client_address[0]).is_loopback
+
+    @property
+    def is_local(self):
+        """This computer, as the same Unix user that runs PhoneDrop. Loopback alone isn't enough:
+        cookies aren't port-scoped, so another account could catch our cookie on a port of its own
+        and replay it from 127.0.0.1."""
+        if not hasattr(self, "_local"):
+            self._local = self.is_loopback and (not self.check_uid or self.peer_uid() == os.getuid())
+        return self._local
+
+    def peer_uid(self):
+        """The uid owning the client end of this TCP connection (from /proc/net/tcp), or None."""
+        for name in TCP_TABLES:
+            try:
+                with open(name) as f:
+                    uid = tcp_owner(f.read(), self.client_address[1], self.server.server_address[1],
+                                    self.client_address[0])
+            except OSError:
+                continue
+            if uid is not None:
+                return uid
+        return None
 
     def log_message(self, fmt, *args):
         msg = fmt % args
+        # Pairing and guest links carry their secret in the query, whatever the parameter is called.
+        msg = re.sub(r'((?:^|[\s"]|://[^/\s"]*)/(?:pair|g)[^\s?"]*)\?[^\s"]*', r"\1?<redacted>", msg)
         msg = re.sub(r"([?&]t=)[^& \"]+", r"\1<redacted>", msg)
+        msg = msg.translate(CONTROL_CHARS)
         sys.stderr.write(f"{time.strftime('%H:%M:%S')} {self.client_address[0]:<15} {msg}\n")
 
     def send_common(self, status, ctype, length, extra=None, csp=PAGE_CSP):
@@ -1179,7 +1304,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         try:
             return json.loads(self.rfile.read(length) or b"{}")
-        except ValueError:
+        except (ValueError, RecursionError):
             return None
 
     def cookie(self, name):
@@ -1218,10 +1343,16 @@ class Handler(BaseHTTPRequestHandler):
     # ---- dispatch
 
     def handle_one_request(self):
+        self.connection.settimeout(HEADER_TIMEOUT)  # until parse_request() has the headers
         try:
             super().handle_one_request()
         except (ConnectionError, ssl.SSLError, TimeoutError):
             self.close_connection = True
+
+    def parse_request(self):
+        ok = super().parse_request()
+        self.connection.settimeout(BODY_TIMEOUT)
+        return ok
 
     def route(self, method):
         if not self.host_ok():
@@ -1333,6 +1464,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_pair(self, token):
         ip = self.client_address[0]
+        if self.is_loopback and not self.is_local:  # another account here: refused before the lockout counts it
+            return self.error(403, "Only the user running PhoneDrop can pair from this computer")
         if self.state.pair_blocked(ip):
             return self.error(429, "Too many failed attempts. Try again later.")
         kind = self.state.check_token(token, self.is_local) if token else None
@@ -1347,6 +1480,8 @@ class Handler(BaseHTTPRequestHandler):
         # The PC's own one-time code proves it is this computer; a scanned QR needs approval on the PC.
         status = "active" if kind == "local" or self.state.no_confirm else "pending"
         sid, rec = self.state.new_session(ip, self.headers.get("User-Agent", ""), status)
+        if not sid:
+            return self.error(429, "Too many pending requests; approve or deny the existing ones first")
         cookie = self.session_cookie(sid, SESSION_TTL)
         if status == "pending":
             msg = f"{rec['name']} ({ip}) wants to pair"
@@ -1364,6 +1499,8 @@ class Handler(BaseHTTPRequestHandler):
         if old and old.get("role") == "device" and old["status"] == "active":
             # Already paired (e.g. the owner tested the link): keep that session, leave the token unused.
             return self.send_common(303, "text/plain", 0, {"Location": "/", "Cache-Control": "no-store"})
+        if self.is_loopback and not self.is_local:  # another account here: refused before the lockout counts it
+            return self.error(403, "Only the user running PhoneDrop can use this from this computer")
         if st.pair_blocked(ip):
             return self.error(429, "Too many failed attempts. Try again later.")
         if not token or not st.consume_guest_token(token):
@@ -1477,7 +1614,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_zip(self, names=None):
         if names is not None:
-            paths = [p for p in (self.state.resolve(n) for n in names[:1000]) if p]
+            names = list(dict.fromkeys(names[:1000]))  # each file once, in the order asked
+            paths = [p for p in (self.state.resolve(n) for n in names) if p]
             if not paths:
                 return self.error(404, "No such files")
         else:
@@ -1506,13 +1644,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(400, "Empty file", close=True)
         if length > st.max_bytes:
             return self.error(413, f"File too large (max {human(st.max_bytes)})", close=True)
-        if shutil.disk_usage(st.store).free < length + 256 * 1024 * 1024:
-            return self.error(507, "Not enough disk space on the computer", close=True)
+        reserved = length
+        with st.lock:  # uploads still in progress count as used, so parallel ones can't overfill the disk
+            if shutil.disk_usage(st.store).free < length + st.inflight + DISK_RESERVE:
+                return self.error(507, "Not enough disk space on the computer", close=True)
+            st.inflight += reserved
 
         raw = self.headers.get("X-Filename", "image")  # http.server decodes headers as latin-1
         orig = urllib.parse.unquote(raw.encode("latin-1", "replace").decode("utf-8", "replace"))[:255]
         tmp = st.partial / f"{secrets.token_hex(8)}.part"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError:
+            with st.lock:
+                st.inflight -= reserved
+            raise
         try:
             with os.fdopen(fd, "wb") as out:
                 remaining, head = length, b""
@@ -1533,13 +1679,19 @@ class Handler(BaseHTTPRequestHandler):
 
             stripped = False
             if not st.keep_metadata:
-                stripped = strip_metadata(tmp, ext) if kind == "image" else strip_video(tmp, ext) if kind == "video" else False
+                if kind == "image":
+                    stripped = strip_metadata(tmp, ext)
+                    if not stripped and ext in STRIPPABLE:  # never keep a photo we couldn't clean
+                        tmp.unlink(missing_ok=True)
+                        return self.error(415, "The image file is malformed")
+                elif kind == "video":
+                    stripped = strip_video(tmp, ext)
             if stripped:
                 length = tmp.stat().st_size
             stem = safe_stem(orig, kind)
             if guest:  # so you can tell at a glance what came from outside
                 stem = "guest-" + stem
-            os.chmod(tmp, 0o644)
+            os.chmod(tmp, 0o600)
             for i in range(10000):
                 final = st.store / (f"{stem}.{ext}" if i == 0 else f"{stem}-{i}.{ext}")
                 try:
@@ -1557,11 +1709,16 @@ class Handler(BaseHTTPRequestHandler):
                 st.clipper.request(final.name)
             if st.hasher:
                 st.hasher.request(final.name)
-            self.send_json({"name": final.name, "size": length}, 201)
+            # "kept" tells the uploader that location and device tags may still be in the file.
+            kept = kind in ("image", "video") and ext not in ("gif", "bmp")
+            self.send_json({"name": final.name, "size": length,
+                            "meta": "stripped" if stripped else "kept" if kept else None}, 201)
         except (ConnectionError, TimeoutError, ssl.SSLError):
             self.close_connection = True
         finally:
             tmp.unlink(missing_ok=True)
+            with st.lock:
+                st.inflight -= reserved
 
     def do_thumb(self, name, size):
         p = self.state.resolve(name)
@@ -1661,10 +1818,50 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
 
-class TLSServer(ThreadingHTTPServer):
+class LimitedServer:
+    """Mixin for both listeners: caps open connections in total and per client IP, so idle or slow
+    clients can't pile up threads. A connection over the limit is closed straight away."""
     daemon_threads = True
     request_queue_size = 64
 
+    def __init__(self, *args, **kwargs):
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.per_ip = {}  # ip -> open connections
+        self.per_ip_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        ip = client_address[0]
+        if not self.slots.acquire(blocking=False):
+            return self.shutdown_request(request)
+        with self.per_ip_lock:
+            if self.per_ip.get(ip, 0) >= MAX_CONNECTIONS_PER_IP:
+                self.slots.release()
+                return self.shutdown_request(request)
+            self.per_ip[ip] = self.per_ip.get(ip, 0) + 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:  # the worker thread didn't start, so it won't release the slot
+            self._release(ip)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release(client_address[0])
+
+    def _release(self, ip):
+        with self.per_ip_lock:
+            n = self.per_ip.get(ip, 0) - 1
+            if n > 0:
+                self.per_ip[ip] = n
+            else:
+                self.per_ip.pop(ip, None)
+        self.slots.release()
+
+
+class TLSServer(LimitedServer, ThreadingHTTPServer):
     def __init__(self, addr, handler, ctx):
         self.ctx = ctx
         super().__init__(addr, handler)
@@ -1675,9 +1872,8 @@ class TLSServer(ThreadingHTTPServer):
         return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
 
 
-class PlainServer(ThreadingHTTPServer):
-    daemon_threads = True
-    request_queue_size = 64
+class PlainServer(LimitedServer, ThreadingHTTPServer):
+    pass
 
 
 # ---------------------------------------------------------------- TLS cert
@@ -1686,41 +1882,81 @@ def openssl(*args):
     return subprocess.run(["openssl", *args], check=True, capture_output=True)
 
 
+CA_VERSION = 2  # 2: the root carries name constraints (cert.json "ca"); older roots are replaced
+# The only addresses and names the root may vouch for: private, CGNAT, link-local and loopback IPs,
+# and *.local / localhost. A leaked root key then can't be used to impersonate any public site.
+CA_PERMITTED_NETS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16")]
+CA_NAME_CONSTRAINTS = "nameConstraints=critical," + ",".join(
+    [f"permitted;IP:{n.network_address}/{n.netmask}" for n in CA_PERMITTED_NETS]
+    + ["permitted;DNS:.local", "permitted;DNS:localhost"])
+
+
+def ca_constrained(ca: Path) -> bool:
+    r = subprocess.run(["openssl", "x509", "-noout", "-text", "-in", str(ca)], capture_output=True, text=True)
+    return r.returncode == 0 and "X509v3 Name Constraints: critical" in r.stdout
+
+
 def ensure_ca():
-    """Private root CA, made once. A phone that installs it trusts every leaf it signs, whatever the IP."""
+    """Private root CA, made once. A phone that installs it trusts every leaf it signs, within the
+    addresses and names in CA_NAME_CONSTRAINTS."""
     ca, ca_key = CONFIG_DIR / "ca.pem", CONFIG_DIR / "ca-key.pem"
     if ca.exists() and ca_key.exists():
-        return ca, ca_key
-    print("Generating the PhoneDrop root certificate (once)…")
+        try:
+            version = json.loads((CONFIG_DIR / "cert.json").read_text()).get("ca")
+        except (OSError, ValueError, AttributeError):
+            version = None
+        if version == CA_VERSION and ca_constrained(ca):
+            return ca, ca_key
+        print("Replacing the PhoneDrop root certificate with one that is limited to local addresses.\n"
+              "  NOTE: a phone that installed the old root must install the new one from /ca.crt\n"
+              "  (and can remove the old one), or it will show a certificate warning again.")
+    else:
+        print("Generating the PhoneDrop root certificate (once)…")
     openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
             "-keyout", str(ca_key), "-out", str(ca), "-days", "3650", "-subj", "/CN=PhoneDrop Root CA/O=PhoneDrop",
             "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-            "-addext", "subjectKeyIdentifier=hash")
+            "-addext", "subjectKeyIdentifier=hash", "-addext", CA_NAME_CONSTRAINTS)
     os.chmod(ca_key, 0o600)
     return ca, ca_key
 
 
 def ensure_cert(ips):
-    """Leaf certificate for the current LAN IPs, signed by the root; only the leaf is re-issued when they change."""
+    """Leaf certificate for the current LAN IPs, signed by the root; only the leaf is re-issued when they
+    change. Returns (leaf, key, root, chain); chain.pem is leaf + root, which is what the server sends."""
     cert, key, meta = CONFIG_DIR / "cert.pem", CONFIG_DIR / "key.pem", CONFIG_DIR / "cert.json"
     want = sorted(set(ips) | {"127.0.0.1"})
     ca, ca_key = ensure_ca()
+    cert, key = _ensure_leaf(cert, key, meta, want, ca, ca_key)
+    chain = CONFIG_DIR / "chain.pem"
+    pem = cert.read_text() + ca.read_text()
+    if not chain.exists() or chain.read_text() != pem:  # follows every change of the leaf or the root
+        chain.write_text(pem)
+    return cert, key, ca, chain
+
+
+def _ensure_leaf(cert, key, meta, want, ca, ca_key):
     # A leaf from the old self-signed layout, or signed by a root that has since been replaced, fails this.
     signed = cert.exists() and key.exists() and subprocess.run(
         ["openssl", "verify", "-CAfile", str(ca), str(cert)], capture_output=True).returncode == 0
     try:
         info = json.loads(meta.read_text())
-        if (signed and info.get("ca") is True and set(want) <= set(info["ips"])
+        if (signed and info.get("ca") == CA_VERSION and set(want) <= set(info["ips"])
                 and info["expires"] > time.time() + 7 * 86400):
-            return cert, key, ca
-        migrate = info.get("ca") is not True or not signed
+            return cert, key
+        migrate = info.get("ca") != CA_VERSION or not signed
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         migrate = True
     if cert.exists() and migrate:
         print("Replacing the old certificate with one signed by the PhoneDrop root certificate.")
     else:
         print("Issuing a new TLS certificate for this computer's addresses…")
-    san = ",".join([f"IP:{ip}" for ip in want] + ["DNS:localhost", f"DNS:{socket.gethostname()}.local"])
+    # The root can't vouch for addresses outside its name constraints, so those stay out of the leaf.
+    covered = [ip for ip in want if any(ipaddress.ip_address(ip) in n for n in CA_PERMITTED_NETS)]
+    for ip in sorted(set(want) - set(covered)):
+        print(f"  WARNING: {ip} is not a private address, so the certificate can't cover it. The phone must use "
+              f"one of: {', '.join(covered)} or {socket.gethostname()}.local")
+    san = ",".join([f"IP:{ip}" for ip in covered] + ["DNS:localhost", f"DNS:{socket.gethostname()}.local"])
     days = 825  # Apple's maximum for TLS server certificates
     csr, ext = CONFIG_DIR / "leaf.csr.tmp", CONFIG_DIR / "leaf.ext.tmp"
     try:
@@ -1734,8 +1970,8 @@ def ensure_cert(ips):
     finally:
         csr.unlink(missing_ok=True)
         ext.unlink(missing_ok=True)
-    meta.write_text(json.dumps({"ips": want, "expires": time.time() + days * 86400, "ca": True}))
-    return cert, key, ca
+    meta.write_text(json.dumps({"ips": want, "expires": time.time() + days * 86400, "ca": CA_VERSION}))
+    return cert, key
 
 
 def cert_fingerprint(cert: Path) -> str:
@@ -1761,7 +1997,8 @@ def qr_data_url(url):
     if not shutil.which("qrencode"):
         return None
     try:
-        r = subprocess.run(["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-", url],
+        # The URL goes in on stdin, so other users can't read the secret in it from `ps`.
+        r = subprocess.run(["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-"], input=url.encode(),
                            capture_output=True, timeout=10)
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -1772,7 +2009,7 @@ def qr_data_url(url):
 
 def print_qr(url):
     if shutil.which("qrencode"):
-        subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", url])
+        subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2"], input=url.encode())  # stdin: not in `ps`
     else:
         print("(install `qrencode` to show a QR code here)")
 
@@ -1816,7 +2053,7 @@ def main():
     ips = lan_ips()
     ip = primary_ip()
     bind = args.bind or ip
-    cert, key, ca = ensure_cert(ips)
+    cert, key, ca, chain = ensure_cert(ips)
 
     hosts = {f"127.0.0.1:{args.local_port}", f"localhost:{args.local_port}",
              f"127.0.0.1:{args.port}", f"localhost:{args.port}",
@@ -1827,10 +2064,14 @@ def main():
     Handler.local_port = args.local_port
     Handler.phone_base = f"https://{ip}:{args.port}"
     Handler.ca_der = ssl.PEM_cert_to_DER_cert(ca.read_text())
+    Handler.check_uid = os.path.exists(TCP_TABLES[0])
+    if not Handler.check_uid:
+        print("WARNING: /proc/net/tcp is not available, so every account on this computer counts as "
+              "'this computer' (loopback only).")
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(cert, key)  # leaf only: the root is the phone's trust anchor
+    ctx.load_cert_chain(chain, key)  # leaf + root, so the phone's certificate viewer shows the root
 
     try:
         lan = TLSServer((bind, args.port), Handler, ctx)
@@ -1848,7 +2089,8 @@ def main():
     print(f"  Saving to:   {state.store}" + (f"  (deleted after {state.keep_days} day(s))" if state.keep_days else ""))
     print(f"  This PC:     http://127.0.0.1:{args.local_port}")
     print(f"  Phone:       https://{ip}:{args.port}   (same Wi-Fi)")
-    print(f"  Root CA SHA-256 {cert_fingerprint(ca)}")
+    print(f"  Root CA SHA-256 {cert_fingerprint(ca)}   <- compare this one on the phone")
+    print(f"  Cert SHA-256    {cert_fingerprint(cert)}")
     print("\n  Scan with your phone camera to pair (until the root certificate is installed, your browser")
     print("  warns about the certificate — check the root fingerprint above and continue):\n")
     print_qr(phone_url)
@@ -1868,6 +2110,8 @@ def main():
     if not args.no_browser and shutil.which("xdg-open"):
         subprocess.Popen(["xdg-open", pc_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
+    else:  # the terminal belongs to this user, so the one-time code can be shown here
+        print(f"  Open the panel on this computer (works once, for {LOCAL_CODE_TTL // 60} minutes):\n  {pc_url}\n")
 
     try:
         threading.Event().wait()

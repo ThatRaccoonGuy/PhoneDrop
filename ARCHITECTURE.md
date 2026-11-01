@@ -35,7 +35,15 @@ Rules that hold everywhere:
   replayed.
 - Every state-changing request needs the `X-PhoneDrop: 1` header and, when present, a same-origin
   `Origin`. Requests with an unknown `Host` are refused (DNS rebinding).
-- "Local only" endpoints check that the TCP peer is loopback, not a header.
+- "Local only" endpoints check that the TCP peer is loopback **and** owned by the same Unix user
+  (`peer_uid()` via `/proc/net/tcp`; loopback alone where that file doesn't exist), not a header.
+  Another account's loopback request to `/pair` or `/g` gets 403 before the lockout counts it.
+- Each listener accepts at most 64 connections (16 per IP); 20 s socket timeout until the headers
+  are in, 60 s for the body. At most 3 pending pairing requests per IP, 10 in total.
+- Received files are 0600 in a 0700 folder. JPEG/PNG/WebP that fail to strip are rejected (415);
+  ImageMagick inputs are pinned to the sniffed coder (`JPEG:file[0]`), ffmpeg gets
+  `-protocol_whitelist file`, PDF previews prefer `pdftoppm`. Pairing/guest queries are logged
+  as `?<redacted>`, control characters escaped.
 - Pairing secrets live in memory for one run. Nothing in a photographed QR or a browser history
   works after a restart.
 - File types are decided from content; only images, audio/video and PDF are ever served inline, and
@@ -87,12 +95,16 @@ any device; once the session ends, the page's next request gets 401 and it says 
 
 ## Certificates
 
-A private root CA is generated once (`ca.pem` / `ca-key.pem`, mode 0600, ECDSA P-256, 10 years) and
+A private root CA is generated once (`ca.pem` / `ca-key.pem`, mode 0600, ECDSA P-256, 10 years) with
+critical name constraints (private/CGNAT/link-local/loopback IPs, `.local`, `localhost`) and
 used to sign a short-lived **leaf** certificate for the current LAN IPs. When the IP changes, only
-the leaf is re-issued; a phone that trusted the root keeps verifying TLS properly. `GET /ca.crt`
+the leaf is re-issued; a phone that trusted the root keeps verifying TLS properly. A LAN IP outside
+the constrained ranges is left out of the leaf (with a warning). `cert.json` records `"ca": 2`; an
+older root (other value, or no Name Constraints) is regenerated along with the leaf and a notice is
+printed. The server sends `chain.pem` (leaf + root, rewritten whenever either changes). `GET /ca.crt`
 serves the root certificate (public information) so phones can install it; the locked and pending
-pages link to it with per-platform instructions. The terminal prints the **root** fingerprint, which
-is what iOS/Android show in their certificate installer.
+pages link to it with per-platform instructions. The terminal prints the **root** fingerprint first (the
+one to compare: iOS/Android show it in their certificate installer), then the leaf's.
 
 ## Hashes
 

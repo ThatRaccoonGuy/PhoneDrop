@@ -77,16 +77,20 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 - **Pairing required**: a 256-bit secret in the QR code, new on every run, never saved to disk, and
   only accepted for 10 minutes after startup. An old QR code or a pairing link left in browser
   history is useless. The PC's browser pairs with a separate one-time code that only works from
-  this computer. Pairing sets a 30-day HttpOnly session cookie; session IDs are stored hashed in
-  `~/.config/phonedrop/` (mode 0700).
+  this computer, as the user running PhoneDrop, and expires 2 minutes after startup. Pairing sets
+  a 30-day HttpOnly session cookie; session IDs are stored hashed in `~/.config/phonedrop/`
+  (mode 0700).
 - **Approval on the PC**: scanning the QR alone isn't enough. A new device only gets a "waiting
   for approval" page until you click **Allow** in the panel on this computer; requests nobody
-  approves expire after 15 minutes. The **Devices** dialog (this computer only) shows every paired
-  device with its IP and when it was last seen, and **Revoke** cuts one off immediately.
+  approves expire after 15 minutes, and at most 3 per IP (10 in total) can wait at once. The
+  **Devices** dialog (this computer only) shows every paired device with its IP and when it was
+  last seen, and **Revoke** cuts one off immediately.
 - **LAN only by default**: the phone port listens on your LAN address, not on every interface
   (VPNs, Docker networks, public IPs). PhoneDrop warns you if that address isn't a private one.
 - **Encrypted on the LAN**: TLS 1.2+ with an auto-generated ECDSA certificate. The PC uses plain HTTP,
   but only on 127.0.0.1.
+- **Connection limits**: at most 64 open connections per port and 16 per client IP; a client that
+  stays silent for 20 s before its request is complete (60 s while sending a body) is disconnected.
 - **Guest links are single use and upload-only**: a random 192-bit token, kept in memory only, valid
   for 10 minutes and used up by the first visit (making a new link or clicking **Revoke link**
   cancels the old one). A guest can only upload; it can't list, download or delete anything, read
@@ -97,7 +101,9 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   changes, only that certificate is re-issued. The root's private key (`ca-key.pem`, mode 0600)
   never leaves `~/.config/phonedrop/`; only the public root certificate is offered at `/ca.crt`.
   Trusting it on a phone means: whoever holds `ca-key.pem` can impersonate this computer to that
-  phone. Nothing else — it's a private root that only ever signs PhoneDrop's own certificate. If
+  phone. Nothing else: the root carries critical name constraints, so it can only vouch for private,
+  CGNAT, link-local and loopback IPs, `*.local` and `localhost`, never for a public site. Roots made
+  by older versions (without constraints) are replaced on start; reinstall the new one on the phone. If
   you think the key was copied, delete `ca.pem` and `ca-key.pem` (a new root is made on the next
   start) and remove the old profile/certificate from the phone.
 - **Brute-force lockout**: 8 bad pairing or guest-link attempts per IP → 15-minute block.
@@ -108,14 +114,15 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   (MP3, M4A, OGG, WAV, FLAC), PDF, archives (ZIP, 7z, gz, tar), office/e-book documents and plain
   text. SVG, HTML, executables and anything else are rejected. Only images, audio/video and PDFs
   are ever shown inline; every other file is served as a download, never rendered. Names are
-  sanitized, files are written atomically and never overwrite each other, and there are checks for
-  size and free disk space.
+  sanitized, files are written atomically with mode 0600 into a 0700 folder and never overwrite
+  each other, and there are checks for size and free disk space (counting uploads in progress).
 - **Metadata stripped on arrival**: phone photos carry GPS coordinates, the phone model and serial
   numbers, and often a hidden trailer (embedded "motion photo" video, depth map). PhoneDrop removes
   all of that from JPEG, PNG and WebP files without re-encoding them (pixels stay identical, only
   the orientation tag is kept). MP4/MOV videos are remuxed with `ffmpeg` to drop their location
-  and device tags (streams are copied, not re-encoded). HEIC/AVIF/TIFF/WebM/MKV are stored as-is;
-  the terminal log says which.
+  and device tags (streams are copied, not re-encoded). A JPEG/PNG/WebP that can't be parsed is
+  rejected rather than stored with its metadata. HEIC/AVIF/TIFF/WebM/MKV are stored as-is; the
+  terminal log and the upload list say "metadata kept".
   Use `--keep-metadata` to turn this off.
 - **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer; images, media and PDFs
   are the only things ever rendered inline, and they are served under a sandboxing CSP.
@@ -138,8 +145,10 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   you sent a link to can upload.
 - **Don't expose it to the internet**: no port forwarding, and don't use `--bind 0.0.0.0` on a
   machine with a public IP. It's built for a local network.
-- **The PC side is plain HTTP on 127.0.0.1**, which never leaves your computer. Other user accounts
-  on the same computer can reach the port, but they still need a paired session.
+- **The PC side is plain HTTP on 127.0.0.1**, which never leaves your computer. "This computer"
+  means the same Unix user: connections from other accounts are refused as local (checked via
+  `/proc/net/tcp`), so they can't pair with the PC's code or use PC-only features, and still need a
+  paired session like any device.
 - **Paired sessions last 30 days** and aren't tied to the device's IP. Anyone who copies the
   session cookie out of a paired browser gets the same access.
 
