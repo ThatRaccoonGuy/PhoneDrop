@@ -159,6 +159,12 @@ body.locked { min-height: 100dvh; display: flex; align-items: center; justify-co
 body.locked .card { padding: 32px; text-align: center; max-width: 380px; align-items: center; animation: none; }
 body.locked h1 { font-size: 20px; margin: 14px 0 6px; }
 body.locked p { color: var(--muted); margin: 0; }
+body.locked .trust { margin-top: 22px; width: 100%; text-align: left; border-top: 1px solid var(--line); padding-top: 14px; }
+.trust summary { cursor: pointer; color: var(--accent); font-size: 14px; font-weight: 600; text-align: center; }
+.trust summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+body.locked .trust p { margin: 12px 0 4px; color: var(--text); font-size: 14px; }
+.trust .btn { width: 100%; }
+.trust ol { margin: 0; padding-left: 20px; color: var(--muted); font-size: 13px; display: grid; gap: 4px; }
 
 .pair-banner { display: grid; gap: 8px; margin-bottom: 12px; }
 .pair-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;

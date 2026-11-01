@@ -12,8 +12,13 @@ python3 phonedrop.py
 ```
 
 1. A QR code appears in the terminal and the panel opens in your browser.
-2. Within 10 minutes, scan the QR with your phone (same Wi-Fi). Accept the self-signed certificate
-   warning once (compare the SHA-256 fingerprint printed in the terminal if you want to be sure).
+2. Within 10 minutes, scan the QR with your phone (same Wi-Fi). Accept the certificate warning
+   (compare the root SHA-256 fingerprint printed in the terminal if you want to be sure). Optional,
+   once per phone: open **Trust this computer** on the pairing page, download the root certificate
+   and install it as the page explains (iPhone: install the profile, then enable it under
+   Settings → General → About → Certificate Trust Settings; Android: Settings → Security →
+   Encryption & credentials → Install a certificate → CA certificate). After that the warning is
+   gone for good, even when the computer's IP address changes.
    The phone then waits for approval: the panel on the computer shows "iPhone · Safari (…) wants
    to pair" (plus a desktop notification if `notify-send` is installed); click **Allow**.
    Paired devices stay paired for 30 days; to pair a new one later, restart PhoneDrop. **Devices**
@@ -69,6 +74,14 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   (VPNs, Docker networks, public IPs). PhoneDrop warns you if that address isn't a private one.
 - **Encrypted on the LAN**: TLS 1.2+ with an auto-generated ECDSA certificate. The PC uses plain HTTP,
   but only on 127.0.0.1.
+- **Private root certificate**: on first run PhoneDrop creates its own root CA (10 years) and uses
+  it to sign a short-lived certificate for the computer's current LAN addresses; when the address
+  changes, only that certificate is re-issued. The root's private key (`ca-key.pem`, mode 0600)
+  never leaves `~/.config/phonedrop/`; only the public root certificate is offered at `/ca.crt`.
+  Trusting it on a phone means: whoever holds `ca-key.pem` can impersonate this computer to that
+  phone. Nothing else — it's a private root that only ever signs PhoneDrop's own certificate. If
+  you think the key was copied, delete `ca.pem` and `ca-key.pem` (a new root is made on the next
+  start) and remove the old profile/certificate from the phone.
 - **Brute-force lockout**: 8 bad pairing attempts per IP → 15-minute block.
 - **CSRF / DNS rebinding**: changes need a custom header plus a matching Origin, and requests with
   an unknown `Host` header are rejected.
@@ -91,10 +104,11 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 
 ### Know this before you use it
 
-- **Use it on networks you trust** (home Wi-Fi, a phone hotspot). The certificate is self-signed, so
-  the very first connection can't be verified automatically. On public or shared Wi-Fi, an attacker
-  could intercept that first visit and steal the pairing secret. Comparing the SHA-256 fingerprint
-  shown on your phone with the one printed in the terminal rules this out.
+- **Use it on networks you trust** (home Wi-Fi, a phone hotspot). Until the phone trusts PhoneDrop's
+  root certificate, the first connection can't be verified automatically. On public or shared Wi-Fi,
+  an attacker could intercept that first visit and steal the pairing secret. Comparing the root
+  SHA-256 fingerprint printed in the terminal with the one your phone's certificate installer
+  shows rules this out, and once the root is installed every later connection is verified.
 - **A paired device has full access**: it can see, download, upload and delete every image in the
   PhoneDrop folder. Only pair your own devices, and don't show the QR code to anyone (or in a
   screenshot or stream) while the pairing window is open, and only approve requests you expect.
