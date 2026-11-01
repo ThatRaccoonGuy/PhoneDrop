@@ -112,7 +112,7 @@ async function runJob({ file, row, bar, status }) {
         status.textContent = `${Math.round(p * 100)}%`;
       });
       bar.style.width = '100%';
-      status.textContent = 'Sent';
+      status.textContent = res.meta === 'kept' ? 'Sent (metadata kept)' : 'Sent';
       row.classList.add('done');
       addSent(res.name);
       return;

@@ -124,7 +124,7 @@ async function runJob({ file, row, bar, status }) {
         status.textContent = `${Math.round(p * 100)}%`;
       });
       bar.style.width = '100%';
-      status.textContent = `Saved as ${res.name}`;
+      status.textContent = `Saved as ${res.name}${res.meta === 'kept' ? ' (metadata kept)' : ''}`;
       row.classList.add('done');
       return;
     } catch (e) {
