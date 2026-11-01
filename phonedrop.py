@@ -411,6 +411,7 @@ class State:
         self.thumb_slots = threading.BoundedSemaphore(2)  # cap concurrent decoders
         self.max_bytes = max_bytes
         self.clipper = None
+        self.hasher = None
         self.notes_file = store / ".notes.json"
         self.notes_tick = 0
         try:
@@ -628,7 +629,8 @@ class State:
 
     def version(self) -> str:
         tick = self.clipper.tick if self.clipper else 0
-        return f"{self.store.stat().st_mtime_ns}.{tick}.{self.notes_tick}.{self.sessions_tick}"
+        hashes = self.hasher.tick if self.hasher else 0
+        return f"{self.store.stat().st_mtime_ns}.{tick}.{self.notes_tick}.{self.sessions_tick}.{hashes}"
 
     # ---- notes (text and links shared between devices)
 
@@ -679,6 +681,8 @@ class State:
         self.drop_thumbs(name)
         if self.clipper:
             self.clipper.forget(name)
+        if self.hasher:
+            self.hasher.forget(name)
         return True
 
     # ---- automatic cleanup
@@ -786,6 +790,7 @@ class State:
                  "url": f"/f/{q}?v={st.st_mtime_ns}", "thumb": f"/t/{q}?v={st.st_mtime_ns}"}
             if self.clipper and kind == "image":
                 f["clip"], f["clipPct"] = self.clipper.status(p)
+            f["sha256"] = self.hasher.status(p) if self.hasher else None
             files.append(f)
         files.sort(key=lambda f: f["mtime"], reverse=True)
         return files
@@ -957,6 +962,103 @@ class Clipper:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+# ---------------------------------------------------------------- SHA-256 per file
+
+class Hasher:
+    """Computes the SHA-256 of every file in the background, so a copy made from here can be verified
+    later. (It is the digest of the stored file; images and videos usually differ from the phone's
+    original because their metadata was stripped on arrival.)
+
+    One file at a time, newest first. Digests are cached in .hashes.json with the mtime_ns they
+    were computed for, so a restart only hashes files that are new or changed.
+    """
+
+    def __init__(self, state: State):
+        self.state = state
+        self.file = state.store / ".hashes.json"
+        self.cv = threading.Condition()
+        self.queue = deque()
+        self.current = None  # name being hashed
+        self.tick = 0  # bumped whenever a digest becomes available
+        try:
+            raw = json.loads(self.file.read_text())
+        except (OSError, ValueError):
+            raw = {}
+        self.hashes = {k: v for k, v in (raw.items() if isinstance(raw, dict) else ())
+                       if isinstance(v, dict) and isinstance(v.get("mtime_ns"), int)
+                       and isinstance(v.get("sha256"), str)}
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def status(self, p: Path):
+        """The hex digest, or None while it's pending."""
+        try:
+            mtime = p.stat().st_mtime_ns
+        except OSError:
+            return None
+        with self.cv:
+            h = self.hashes.get(p.name)
+        return h["sha256"] if h and h["mtime_ns"] == mtime else None
+
+    def _save(self):
+        """Write .hashes.json. Call with self.cv held."""
+        State._write_private(self.file, json.dumps(self.hashes))
+
+    def request(self, name: str):
+        with self.cv:
+            if name == self.current or name in self.queue:
+                return
+            self.queue.append(name)
+            self.cv.notify()
+
+    def forget(self, name: str):
+        with self.cv:
+            if name in self.queue:
+                self.queue.remove(name)
+            if self.hashes.pop(name, None):
+                self._save()
+
+    def scan(self):
+        """Drop digests of deleted/changed files, and queue every file that lacks one."""
+        files = [p for p in (self.state.resolve(f["name"]) for f in self.state.listing()) if p]
+        mtimes = {p.name: p.stat().st_mtime_ns for p in files}
+        with self.cv:
+            stale = [k for k, v in self.hashes.items() if mtimes.get(k) != v["mtime_ns"]]
+            for k in stale:
+                del self.hashes[k]
+            if stale:
+                self._save()
+        for p in files:  # listing() is newest first
+            if p.name not in self.hashes:
+                self.request(p.name)
+
+    def run(self):
+        while True:
+            with self.cv:
+                while not self.queue:
+                    self.cv.wait()
+                name = self.queue.popleft()
+                self.current = name
+            try:
+                p = self.state.resolve(name)
+                if p and not self.status(p):
+                    mtime = p.stat().st_mtime_ns
+                    h = hashlib.sha256()
+                    with open(p, "rb") as f:
+                        while chunk := f.read(1024 * 1024):
+                            h.update(chunk)
+                    with self.cv:
+                        # Skip if the file was deleted or replaced while it was being read.
+                        if self.state.resolve(name) and p.stat().st_mtime_ns == mtime:
+                            self.hashes[name] = {"mtime_ns": mtime, "sha256": h.hexdigest()}
+                            self._save()
+                            self.tick += 1
+            except Exception as e:  # never let the worker thread die
+                sys.stderr.write(f"hashing {name} failed: {e}\n")
+            finally:
+                with self.cv:
+                    self.current = None
 
 
 # ---------------------------------------------------------------- HTTP
@@ -1341,6 +1443,8 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("received %s (%s%s)", final.name, human(length), ", " + meta if meta else "")
             if st.clipper and kind == "image":
                 st.clipper.request(final.name)
+            if st.hasher:
+                st.hasher.request(final.name)
             self.send_json({"name": final.name, "size": length}, 201)
         except (ConnectionError, TimeoutError, ssl.SSLError):
             self.close_connection = True
@@ -1545,6 +1649,8 @@ def main():
     if shutil.which("wl-copy") and (shutil.which("vips") or shutil.which("magick")):
         state.clipper = Clipper(state, max(1, args.clip_cache))
         state.clipper.scan()
+    state.hasher = Hasher(state)
+    state.hasher.scan()
     ips = lan_ips()
     ip = primary_ip()
     bind = args.bind or ip

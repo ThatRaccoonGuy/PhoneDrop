@@ -25,7 +25,8 @@ python3 phonedrop.py
 4. On the computer: **Copy** puts the image on the clipboard as PNG (each photo is converted in the
    background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
    **Download all** gives a zip, and **Select** lets you pick several files to zip or delete together. You can also drag-and-drop or Ctrl+V images into the PC
-   panel to get them onto your phone.
+   panel to get them onto your phone. The viewer shows each file's SHA-256 (click it to copy the full
+   digest) so you can check a transfer against the original.
 5. **Text and links** work the same way: paste a link or some text into the box on either device
    and it shows up on the other one with **Copy** and **Open** buttons. On the computer, pressing
    Ctrl+V anywhere on the page sends whatever text is on the clipboard.
