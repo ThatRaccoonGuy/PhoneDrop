@@ -1,9 +1,9 @@
 # PhoneDrop
 
-Send photos, videos and files from your phone to your computer over Wi-Fi. No cloud, no accounts, no pip installs:
-just Python 3 and `openssl`. Optional extras: `qrencode` (QR code in the terminal), `vipsthumbnail` or
-ImageMagick (fast gallery previews, HEIC support), `ffmpeg` (video previews and video metadata
-stripping), `wl-copy` (clipboard on Wayland).
+Send photos, videos, files and text between your phone and your computer over Wi-Fi. No cloud,
+no accounts, no pip installs: just Python 3 and `openssl`. Optional extras: `qrencode` (QR codes),
+`vipsthumbnail` or ImageMagick (fast previews, HEIC support), `ffmpeg` (video previews and video
+metadata stripping), `wl-copy` (clipboard on Wayland), `notify-send` (desktop notifications).
 
 ```bash
 git clone https://github.com/ThatRaccoonGuy/PhoneDrop.git
@@ -11,30 +11,41 @@ cd PhoneDrop
 python3 phonedrop.py
 ```
 
+### Pair a phone
+
 1. A QR code appears in the terminal and the panel opens in your browser.
-2. Within 10 minutes, scan the QR with your phone (same Wi-Fi). Accept the certificate warning
-   (compare the root SHA-256 fingerprint printed in the terminal if you want to be sure). Optional,
-   once per phone: open **Trust this computer** on the pairing page, download the root certificate
-   and install it as the page explains (iPhone: install the profile, then enable it under
-   Settings → General → About → Certificate Trust Settings; Android: Settings → Security →
-   Encryption & credentials → Install a certificate → CA certificate). After that the warning is
-   gone for good, even when the computer's IP address changes.
-   The phone then waits for approval: the panel on the computer shows "iPhone · Safari (…) wants
-   to pair" (plus a desktop notification if `notify-send` is installed); click **Allow**.
-   Paired devices stay paired for 30 days; to pair a new one later, restart PhoneDrop. **Devices**
-   in the panel's header lists every paired device and lets you revoke them one by one.
-3. Tap **Send photos & videos** (or **Send files** for PDFs, documents, archives…). They show up
-   live on the computer, saved to `~/Pictures/PhoneDrop`. Videos and audio play in the panel.
-   Going the other way, **Share** on the phone opens its share sheet, where you can save to the
-   camera roll ("Save Image" / "Save Video" on iPhone) or pass the file to any app.
-4. On the computer: **Copy** puts the image on the clipboard as PNG (each photo is converted in the
-   background as it arrives, with a progress bar; Copy unlocks when it's ready), **Save** downloads it,
-   **Download all** gives a zip, and **Select** lets you pick several files to zip or delete together. You can also drag-and-drop or Ctrl+V images into the PC
-   panel to get them onto your phone. The viewer shows each file's SHA-256 (click it to copy the full
-   digest) so you can check a transfer against the original.
-5. **Text and links** work the same way: paste a link or some text into the box on either device
-   and it shows up on the other one with **Copy** and **Open** buttons. On the computer, pressing
-   Ctrl+V anywhere on the page sends whatever text is on the clipboard.
+2. Within 10 minutes, scan the QR with your phone (same Wi-Fi). The phone warns about the
+   certificate the first time; compare the root SHA-256 fingerprint printed in the terminal if
+   you want to be sure, and continue.
+3. The phone now waits for approval. The panel on the computer shows "iPhone · Safari (…) wants to
+   pair" (and a desktop notification, if `notify-send` is installed): click **Allow**. Paired
+   devices stay paired for 30 days; to pair another one later, restart PhoneDrop.
+
+Optional, once per phone: open **Trust this computer** on the pairing page and install the root
+certificate as the page explains (iPhone: install the profile, then enable it under Settings →
+General → About → Certificate Trust Settings; Android: Settings → Security → Encryption &
+credentials → Install a certificate → CA certificate). The warning is then gone for good, even
+when the computer's IP address changes.
+
+### Use it
+
+- **Phone → computer**: tap **Send photos & videos**, or **Send files** for PDFs, documents and
+  archives. They appear live on the computer, saved to `~/Pictures/PhoneDrop`. Videos and audio
+  play right in the panel.
+- **Computer → phone**: drag files onto the panel or press Ctrl+V; on the phone, **Share** opens
+  the share sheet (iPhone: "Save Image" / "Save Video") or hands the file to any app.
+- **On the computer**: **Copy** puts an image on the clipboard as PNG (photos are converted in the
+  background as they arrive, with a progress bar), **Save** downloads, **Download all** gives a zip,
+  **Select** picks several files to zip or delete together. The viewer shows each file's SHA-256;
+  click it to copy the digest.
+- **Text and links**: paste into the box on either device and it appears on the other with
+  **Copy** and **Open**. On the computer, Ctrl+V anywhere on the page sends the clipboard text.
+- **Devices** (header, computer only) lists every paired device and lets you revoke them one by one.
+- **Guest link** (header, computer only) lets someone who isn't paired send you files: click
+  **Create link** and let them scan the QR (or send them the link). It works once, within
+  10 minutes, and gives a page that can only upload, for 30 minutes (`--guest-minutes`). Their
+  files are saved with a `guest-` prefix and they show up under **Devices**, where you can revoke
+  them early.
 
 If you run a firewall, allow the phone port from your local network only. For example, with UFW
 (replace `192.168.0.0/24` with your network's range):
@@ -51,11 +62,12 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
 | `--local-port` | 8080 | localhost-only HTTP port for this PC |
 | `--bind` | LAN address | interface for the phone port (`0.0.0.0` = all interfaces) |
 | `--pair-minutes` | 10 | how long after startup new devices can pair (`0` = no limit) |
-| `--dir` | `~/Pictures/PhoneDrop` | where images are saved |
+| `--dir` | `~/Pictures/PhoneDrop` | where received files are saved |
 | `--max-mb` | 2048 | per-file size limit |
 | `--clip-cache` | 30 | keep ready-to-paste PNGs for this many recent images (~17 MB each) |
 | `--keep-metadata` | | don't strip EXIF/XMP metadata from received images |
 | `--keep-days` | 0 | delete received files and notes after this many days (0 = keep forever) |
+| `--guest-minutes` | 30 | how long someone who opened a guest link can upload |
 | `--no-confirm` | | pair devices without approval on the PC |
 | `--new-token` | | unpairs every device |
 | `--no-browser` | | don't auto-open the panel |
@@ -75,6 +87,11 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   (VPNs, Docker networks, public IPs). PhoneDrop warns you if that address isn't a private one.
 - **Encrypted on the LAN**: TLS 1.2+ with an auto-generated ECDSA certificate. The PC uses plain HTTP,
   but only on 127.0.0.1.
+- **Guest links are single use and upload-only**: a random 192-bit token, kept in memory only, valid
+  for 10 minutes and used up by the first visit (making a new link or clicking **Revoke link**
+  cancels the old one). A guest can only upload; it can't list, download or delete anything, read
+  the shared text, or see where files are stored. Its session ends after `--guest-minutes`, or as
+  soon as you revoke it under **Devices**. Links can only be made from this computer.
 - **Private root certificate**: on first run PhoneDrop creates its own root CA (10 years) and uses
   it to sign a short-lived certificate for the computer's current LAN addresses; when the address
   changes, only that certificate is re-issued. The root's private key (`ca-key.pem`, mode 0600)
@@ -83,7 +100,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   phone. Nothing else — it's a private root that only ever signs PhoneDrop's own certificate. If
   you think the key was copied, delete `ca.pem` and `ca-key.pem` (a new root is made on the next
   start) and remove the old profile/certificate from the phone.
-- **Brute-force lockout**: 8 bad pairing attempts per IP → 15-minute block.
+- **Brute-force lockout**: 8 bad pairing or guest-link attempts per IP → 15-minute block.
 - **CSRF / DNS rebinding**: changes need a custom header plus a matching Origin, and requests with
   an unknown `Host` header are rejected.
 - **Upload validation**: the type is checked from the file's content, not its name. Accepted:
@@ -100,7 +117,8 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   and device tags (streams are copied, not re-encoded). HEIC/AVIF/TIFF/WebM/MKV are stored as-is;
   the terminal log says which.
   Use `--keep-metadata` to turn this off.
-- **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer, and image files are served sandboxed.
+- **Hardened responses**: strict CSP, no framing, `nosniff`, no referrer; images, media and PDFs
+  are the only things ever rendered inline, and they are served under a sandboxing CSP.
 - Clipboard copy, "Open folder" and device management work only from this computer.
 
 ### Know this before you use it
@@ -110,12 +128,14 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   an attacker could intercept that first visit and steal the pairing secret. Comparing the root
   SHA-256 fingerprint printed in the terminal with the one your phone's certificate installer
   shows rules this out, and once the root is installed every later connection is verified.
-- **A paired device has full access**: it can see, download, upload and delete every image in the
-  PhoneDrop folder. Only pair your own devices, and don't show the QR code to anyone (or in a
+- **A paired device has full access**: it can see, download, upload and delete every file in the
+  PhoneDrop folder and every shared note. Only pair your own devices, and don't show the QR code to anyone (or in a
   screenshot or stream) while the pairing window is open, and only approve requests you expect.
   Revoke a lost device under **Devices**, or run with `--new-token` to unpair everything.
-- **Images are processed by ImageMagick / libvips** (previews and clipboard conversion). Bugs in
-  image decoders have been exploited before, so keep them updated. Only paired devices can upload.
+  Guests (people you sent a guest link) are different: they can only upload, and only for a while.
+- **Files are processed by ImageMagick / libvips / ffmpeg** (previews, clipboard conversion, video
+  remuxing). Bugs in media decoders have been exploited before, so keep them updated. Only paired devices and guests
+  you sent a link to can upload.
 - **Don't expose it to the internet**: no port forwarding, and don't use `--bind 0.0.0.0` on a
   machine with a public IP. It's built for a local network.
 - **The PC side is plain HTTP on 127.0.0.1**, which never leaves your computer. Other user accounts

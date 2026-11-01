@@ -195,3 +195,17 @@ dialog#devices { width: min(560px, calc(100vw - 24px)); max-height: min(80dvh, 6
 .tag.warn { color: #ffcf6b; border-color: rgba(255,207,107,.4); }
 body.locked .pending-name { color: var(--text); font-weight: 600; margin: 4px 0 10px; }
 body.locked .pending-name:empty { display: none; }
+
+dialog#guest { width: min(440px, calc(100vw - 24px)); padding: 0; color: var(--text); background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r); box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+.guest-body { display: grid; gap: 12px; padding: 14px 16px 16px; justify-items: center; text-align: center; }
+.guest-body p { margin: 0; font-size: 14px; }
+.guest-link { display: grid; gap: 10px; justify-items: center; width: 100%; }
+#guestQr { width: 220px; height: 220px; image-rendering: pixelated; border-radius: 8px; background: #fff; }
+.guest-url { display: flex; gap: 8px; width: 100%; }
+.guest-url input { flex: 1; min-width: 0; font: inherit; font-size: 13px; color: var(--text); background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+.sent-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.sent-list li { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px;
+  font-size: 14px; animation: pop .25s ease-out; }
+.hint.ended { color: var(--bad); font-weight: 600; }

@@ -11,8 +11,12 @@ Access requires pairing: scan the QR code printed in the terminal, then click Al
 this computer (--no-confirm skips that). The pairing secret is new on every run and only works for
 a few minutes after startup. Pairing sets a long-lived HttpOnly session cookie. Paired devices can
 be revoked one by one from the panel's Devices dialog, or all at once with --new-token.
+
+Guest links let someone who isn't paired send files once: a single-use link (valid 10 minutes)
+opens an upload-only session for --guest-minutes.
 """
 import argparse
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -47,6 +51,8 @@ PAIR_FAIL_WINDOW = 15 * 60
 PAIR_MINUTES = 10
 PENDING_TTL = 15 * 60  # a pairing request nobody approves is dropped after this long
 LAST_SEEN_FLUSH = 60  # write last_seen times to disk at most this often
+GUEST_LINK_TTL = 10 * 60  # an unused guest link stops working after this long
+GUEST_MINUTES = 30
 
 IMAGE_MIME = {
     "jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp",
@@ -78,6 +84,7 @@ STATIC_FILES = {
     "style.css": "text/css; charset=utf-8",
     "icon.svg": "image/svg+xml",
     "pending.js": "text/javascript; charset=utf-8",
+    "guest.js": "text/javascript; charset=utf-8",
 }
 CLIP_KEEP = 30  # PNG clipboard copies kept for this many most-recently-used images
 THUMB_SIZES = (480, 1600)  # grid, and the viewer for formats browsers can't display (HEIC/TIFF)
@@ -401,9 +408,12 @@ def primary_ip():
 
 class State:
     def __init__(self, store: Path, max_bytes: int, new_token: bool, pair_minutes: int, keep_metadata=False,
-                 keep_days=0, no_confirm=False):
+                 keep_days=0, no_confirm=False, guest_minutes=GUEST_MINUTES):
         self.store = store
         self.no_confirm = no_confirm
+        self.guest_minutes = guest_minutes
+        # Guest drop links: token -> expiry. In memory only and single use, like the pairing secret.
+        self.guest_tokens = {}
         self.keep_metadata = keep_metadata
         self.keep_days = keep_days
         self.partial = store / ".partial"
@@ -496,12 +506,13 @@ class State:
         if structural:
             self.sessions_tick += 1
 
-    def new_session(self, ip: str, ua: str, status="active") -> tuple:
+    def new_session(self, ip: str, ua: str, status="active", role="device", ttl=None) -> tuple:
         sid = secrets.token_urlsafe(32)
         now = time.time()
-        rec = {"id": secrets.token_urlsafe(6), "role": "device", "status": status, "name": device_name(ua),
-               "ip": ip, "created": now, "last_seen": now,
-               "expires": now + (SESSION_TTL if status == "active" else PENDING_TTL)}
+        if ttl is None:
+            ttl = SESSION_TTL if status == "active" else PENDING_TTL
+        rec = {"id": secrets.token_urlsafe(6), "role": role, "status": status, "name": device_name(ua),
+               "ip": ip, "created": now, "last_seen": now, "expires": now + ttl}
         with self.lock:
             self.sessions[self._h(sid)] = rec
             self._save_sessions()
@@ -625,6 +636,34 @@ class State:
                 self.local_code = None
                 return "local"
         return "phone" if self.pairing_open() and hmac.compare_digest(t, self.token.encode()) else None
+
+    # ---- guest drop links (one-time, upload-only access for someone who isn't paired)
+
+    def create_guest_token(self) -> tuple:
+        """A new single-use guest link token and its expiry. Any older, unused link stops working."""
+        token = secrets.token_urlsafe(24)
+        expires = time.time() + GUEST_LINK_TTL
+        with self.lock:
+            self.guest_tokens = {token: expires}
+        return token, expires
+
+    def consume_guest_token(self, t: str) -> bool:
+        """True if t is a live guest token, which is then used up. Expired tokens are dropped on the way."""
+        t = t.encode()
+        now = time.time()
+        with self.lock:
+            for k, exp in list(self.guest_tokens.items()):
+                if exp <= now:
+                    del self.guest_tokens[k]
+                elif hmac.compare_digest(t, k.encode()):
+                    del self.guest_tokens[k]
+                    return True
+        return False
+
+    def revoke_guest_tokens(self) -> int:
+        with self.lock:
+            n, self.guest_tokens = len(self.guest_tokens), {}
+        return n
 
     # ---- files
 
@@ -1077,6 +1116,7 @@ class Handler(BaseHTTPRequestHandler):
     state: State = None
     allowed_hosts: set = set()
     local_port = 8080  # for the "approve it in the panel" hint
+    phone_base = ""  # https://<LAN IP>:<port>, for guest links
     ca_der = b""  # root certificate (DER), served at /ca.crt
 
     # ---- helpers
@@ -1149,6 +1189,10 @@ class Handler(BaseHTTPRequestHandler):
                 return v
         return ""
 
+    def session_cookie(self, sid, max_age):
+        cookie = f"{SESSION_COOKIE}={sid}; Path=/; Max-Age={int(max_age)}; HttpOnly; SameSite=Lax"
+        return cookie + "; Secure" if self.is_tls else cookie
+
     def authed(self):
         sid = self.cookie(SESSION_COOKIE)
         if not self.state.valid_session(sid):
@@ -1188,6 +1232,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET":
             if path == "/pair":
                 return self.do_pair(query.get("t", [""])[0])
+            if path == "/g":
+                return self.do_guest_arrive(query.get("t", [""])[0])
             if path == "/ca.crt":  # public on purpose: phones download it to trust this PC
                 return self.send_ca()
             if path.startswith("/static/"):
@@ -1199,8 +1245,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_static(STATIC_DIR / "manifest.webmanifest", "application/manifest+json")
             if path == "/":
                 s = self.state.session_for(self.cookie(SESSION_COOKIE))
-                page = "locked.html" if not s else "pending.html" if s["status"] == "pending" else "index.html"
-                if page == "index.html":
+                page = ("locked.html" if not s else "pending.html" if s["status"] == "pending"
+                        else "guest.html" if s.get("role") == "guest" else "index.html")
+                if page in ("index.html", "guest.html"):
                     self.authed()  # updates last_seen
                 return self.send_static(STATIC_DIR / page, "text/html; charset=utf-8", "no-store")
             if path == "/api/pair-status":  # the only endpoint a device waiting for approval can reach
@@ -1214,15 +1261,29 @@ class Handler(BaseHTTPRequestHandler):
         if method != "GET" and not self.csrf_ok():
             return self.error(403, "Cross-site request blocked", close=True)
 
+        # Guests get exactly two endpoints: their own info, and upload.
+        guest = self.state.session_for(self.cookie(SESSION_COOKIE))
+        guest = guest if guest and guest.get("role") == "guest" else None
+        if guest:
+            if (method, path) == ("GET", "/api/info"):
+                return self.send_json({"guest": True, "name": guest["name"], "maxBytes": self.state.max_bytes,
+                                       "expires": guest["expires"]})
+            if (method, path) == ("POST", "/api/upload"):
+                return self.do_upload(guest)
+            return self.error(403, "Guests can only upload", close=method != "GET")
+
         name = urllib.parse.unquote(path.rsplit("/", 1)[-1])
         if path == "/api/devices" or path.startswith("/api/devices/"):
             return self.do_devices(method, path)
+        if path == "/api/guest":
+            return self.do_guest_link(method)
         if method == "GET":
             if path == "/api/info":
                 return self.send_json({"local": self.is_local, "maxBytes": self.state.max_bytes,
                                        "serverCopy": self.is_local and self.state.clipper is not None,
                                        "textCopy": self.is_local and bool(shutil.which("wl-copy")),
                                        "keepDays": self.state.keep_days,
+                                       "guestMinutes": self.state.guest_minutes if self.is_local else None,
                                        "folder": str(self.state.store) if self.is_local else None})
             if path == "/api/files":
                 return self.do_list(query.get("wait", [None])[0])
@@ -1286,9 +1347,7 @@ class Handler(BaseHTTPRequestHandler):
         # The PC's own one-time code proves it is this computer; a scanned QR needs approval on the PC.
         status = "active" if kind == "local" or self.state.no_confirm else "pending"
         sid, rec = self.state.new_session(ip, self.headers.get("User-Agent", ""), status)
-        cookie = f"{SESSION_COOKIE}={sid}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax"
-        if self.is_tls:
-            cookie += "; Secure"
+        cookie = self.session_cookie(sid, SESSION_TTL)
         if status == "pending":
             msg = f"{rec['name']} ({ip}) wants to pair"
             self.log_message("%s — approve it in the panel: http://127.0.0.1:%d", msg, self.local_port)
@@ -1297,6 +1356,46 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("paired new device: %s", rec["name"])
         # Redirect strips the token from the address bar / history.
         self.send_common(303, "text/plain", 0, {"Location": "/", "Set-Cookie": cookie, "Cache-Control": "no-store"})
+
+    def do_guest_arrive(self, token):
+        """A guest opened a drop link: trade the one-time token for a short upload-only session."""
+        st, ip = self.state, self.client_address[0]
+        old = st.session_for(self.cookie(SESSION_COOKIE))
+        if old and old.get("role") == "device" and old["status"] == "active":
+            # Already paired (e.g. the owner tested the link): keep that session, leave the token unused.
+            return self.send_common(303, "text/plain", 0, {"Location": "/", "Cache-Control": "no-store"})
+        if st.pair_blocked(ip):
+            return self.error(429, "Too many failed attempts. Try again later.")
+        if not token or not st.consume_guest_token(token):
+            st.pair_failed(ip)
+            return self.error(403, "This guest link is invalid or has expired.")
+        st.pair_succeeded(ip)
+        if old:  # a pending request or an earlier guest visit from this browser
+            st.drop_session(self.cookie(SESSION_COOKIE))
+        ttl = st.guest_minutes * 60
+        sid, rec = st.new_session(ip, self.headers.get("User-Agent", ""), "active", role="guest", ttl=ttl)
+        msg = f"guest arrived: {rec['name']} ({ip})"
+        self.log_message("%s", msg)
+        notify(msg)
+        self.send_common(303, "text/plain", 0, {"Location": "/", "Set-Cookie": self.session_cookie(sid, ttl),
+                                                "Cache-Control": "no-store"})
+
+    def do_guest_link(self, method):
+        """Create (POST) or revoke (DELETE) the guest drop link. Only from this computer."""
+        if not self.is_local:
+            return self.error(403, "Only available on this computer", close=method != "GET")
+        st = self.state
+        if method == "POST":
+            token, expires = st.create_guest_token()
+            url = f"{self.phone_base}/g?t={token}"
+            self.log_message("created a guest link (valid until %s)", time.strftime("%H:%M", time.localtime(expires)))
+            return self.send_json({"url": url, "expires": expires, "qr": qr_data_url(url)})
+        if method == "DELETE":
+            n = st.revoke_guest_tokens()
+            if n:
+                self.log_message("revoked the guest link")
+            return self.send_json({"ok": True, "revoked": n})
+        return self.error(405, "Method not allowed", close=method != "GET")
 
     def do_list(self, wait):
         st = self.state
@@ -1397,7 +1496,7 @@ class Handler(BaseHTTPRequestHandler):
                 if p.is_file():
                     z.write(p, p.name)
 
-    def do_upload(self):
+    def do_upload(self, guest=None):
         st = self.state
         try:
             length = int(self.headers.get("Content-Length", ""))
@@ -1438,6 +1537,8 @@ class Handler(BaseHTTPRequestHandler):
             if stripped:
                 length = tmp.stat().st_size
             stem = safe_stem(orig, kind)
+            if guest:  # so you can tell at a glance what came from outside
+                stem = "guest-" + stem
             os.chmod(tmp, 0o644)
             for i in range(10000):
                 final = st.store / (f"{stem}.{ext}" if i == 0 else f"{stem}-{i}.{ext}")
@@ -1450,7 +1551,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error(409, "Could not pick a file name")
             meta = ("metadata stripped" if stripped else "metadata kept" if st.keep_metadata
                     else "metadata kept: can't strip ." + ext if kind in ("image", "video") else "")
-            self.log_message("received %s (%s%s)", final.name, human(length), ", " + meta if meta else "")
+            self.log_message("received %s (%s%s)%s", final.name, human(length), ", " + meta if meta else "",
+                             f" from guest {guest['name']}" if guest else "")
             if st.clipper and kind == "image":
                 st.clipper.request(final.name)
             if st.hasher:
@@ -1654,6 +1756,20 @@ def notify(msg: str):
         pass
 
 
+def qr_data_url(url):
+    """The URL as a QR code PNG data: URL for the panel, or None without a working qrencode."""
+    if not shutil.which("qrencode"):
+        return None
+    try:
+        r = subprocess.run(["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-", url],
+                           capture_output=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode or not r.stdout.startswith(b"\x89PNG"):
+        return None
+    return "data:image/png;base64," + base64.b64encode(r.stdout).decode()
+
+
 def print_qr(url):
     if shutil.which("qrencode"):
         subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", url])
@@ -1679,13 +1795,16 @@ def main():
                     help="delete received files and notes after this many days (default 0 = keep forever)")
     ap.add_argument("--keep-metadata", action="store_true",
                     help="don't strip EXIF/XMP metadata (GPS location, phone model…) from received images")
+    ap.add_argument("--guest-minutes", type=int, default=GUEST_MINUTES,
+                    help=f"how long a guest can upload after opening a guest link (default {GUEST_MINUTES})")
     ap.add_argument("--no-confirm", action="store_true", help="pair devices without approval on the PC")
     ap.add_argument("--new-token", action="store_true", help="unpair all devices")
     ap.add_argument("--no-browser", action="store_true", help="don't open the panel in your browser")
     args = ap.parse_args()
 
     state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token,
-                  args.pair_minutes, args.keep_metadata, max(0, args.keep_days), args.no_confirm)
+                  args.pair_minutes, args.keep_metadata, max(0, args.keep_days), args.no_confirm,
+                  max(1, args.guest_minutes))
     threading.Thread(target=state.sessions_forever, daemon=True).start()
     if state.keep_days:
         threading.Thread(target=state.cleanup_forever, daemon=True).start()
@@ -1706,6 +1825,7 @@ def main():
     Handler.state = state
     Handler.allowed_hosts = hosts
     Handler.local_port = args.local_port
+    Handler.phone_base = f"https://{ip}:{args.port}"
     Handler.ca_der = ssl.PEM_cert_to_DER_cert(ca.read_text())
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
