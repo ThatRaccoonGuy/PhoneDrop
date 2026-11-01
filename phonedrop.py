@@ -2,7 +2,8 @@
 """PhoneDrop — send photos, videos and files from your phone to this computer over the local network.
 
 Two listeners:
-  * HTTPS on the LAN (default :8443) for the phone (self-signed cert, generated on first run)
+  * HTTPS on the LAN (default :8443) for the phone (certificate signed by a private root CA made on
+    first run; phones can install the root from /ca.crt to stop the warning)
   * HTTP on 127.0.0.1 (default :8080) for this computer's browser (localhost is a secure
     context, so clipboard copy works without certificate warnings)
 
@@ -974,6 +975,7 @@ class Handler(BaseHTTPRequestHandler):
     state: State = None
     allowed_hosts: set = set()
     local_port = 8080  # for the "approve it in the panel" hint
+    ca_der = b""  # root certificate (DER), served at /ca.crt
 
     # ---- helpers
 
@@ -1019,6 +1021,12 @@ class Handler(BaseHTTPRequestHandler):
         data = path.read_bytes()
         self.send_common(200, ctype, len(data), {"Cache-Control": cache})
         self.wfile.write(data)
+
+    def send_ca(self):
+        self.send_common(200, "application/x-x509-ca-cert", len(self.ca_der),
+                         {"Content-Disposition": 'attachment; filename="PhoneDrop-Root-CA.crt"',
+                          "Cache-Control": "no-store"}, csp=FILE_CSP)
+        self.wfile.write(self.ca_der)
 
     def read_json(self, limit=256 * 1024):
         try:
@@ -1078,6 +1086,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET":
             if path == "/pair":
                 return self.do_pair(query.get("t", [""])[0])
+            if path == "/ca.crt":  # public on purpose: phones download it to trust this PC
+                return self.send_ca()
             if path.startswith("/static/"):
                 name = path[len("/static/"):]
                 if name in STATIC_FILES:
@@ -1466,27 +1476,60 @@ class PlainServer(ThreadingHTTPServer):
 
 # ---------------------------------------------------------------- TLS cert
 
+def openssl(*args):
+    return subprocess.run(["openssl", *args], check=True, capture_output=True)
+
+
+def ensure_ca():
+    """Private root CA, made once. A phone that installs it trusts every leaf it signs, whatever the IP."""
+    ca, ca_key = CONFIG_DIR / "ca.pem", CONFIG_DIR / "ca-key.pem"
+    if ca.exists() and ca_key.exists():
+        return ca, ca_key
+    print("Generating the PhoneDrop root certificate (once)…")
+    openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+            "-keyout", str(ca_key), "-out", str(ca), "-days", "3650", "-subj", "/CN=PhoneDrop Root CA/O=PhoneDrop",
+            "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-addext", "subjectKeyIdentifier=hash")
+    os.chmod(ca_key, 0o600)
+    return ca, ca_key
+
+
 def ensure_cert(ips):
+    """Leaf certificate for the current LAN IPs, signed by the root; only the leaf is re-issued when they change."""
     cert, key, meta = CONFIG_DIR / "cert.pem", CONFIG_DIR / "key.pem", CONFIG_DIR / "cert.json"
     want = sorted(set(ips) | {"127.0.0.1"})
+    ca, ca_key = ensure_ca()
+    # A leaf from the old self-signed layout, or signed by a root that has since been replaced, fails this.
+    signed = cert.exists() and key.exists() and subprocess.run(
+        ["openssl", "verify", "-CAfile", str(ca), str(cert)], capture_output=True).returncode == 0
     try:
         info = json.loads(meta.read_text())
-        if set(want) <= set(info["ips"]) and info["expires"] > time.time() + 7 * 86400 and cert.exists() and key.exists():
-            return cert, key
-    except (OSError, ValueError, KeyError):
-        pass
+        if (signed and info.get("ca") is True and set(want) <= set(info["ips"])
+                and info["expires"] > time.time() + 7 * 86400):
+            return cert, key, ca
+        migrate = info.get("ca") is not True or not signed
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        migrate = True
+    if cert.exists() and migrate:
+        print("Replacing the old certificate with one signed by the PhoneDrop root certificate.")
+    else:
+        print("Issuing a new TLS certificate for this computer's addresses…")
     san = ",".join([f"IP:{ip}" for ip in want] + ["DNS:localhost", f"DNS:{socket.gethostname()}.local"])
-    days = 825
-    print("Generating a new self-signed TLS certificate…")
-    subprocess.run([
-        "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-        "-nodes", "-keyout", str(key), "-out", str(cert), "-days", str(days), "-subj", "/CN=PhoneDrop",
-        "-addext", f"subjectAltName={san}", "-addext", "basicConstraints=critical,CA:FALSE",
-        "-addext", "extendedKeyUsage=serverAuth",
-    ], check=True, capture_output=True)
-    os.chmod(key, 0o600)
-    meta.write_text(json.dumps({"ips": want, "expires": time.time() + days * 86400}))
-    return cert, key
+    days = 825  # Apple's maximum for TLS server certificates
+    csr, ext = CONFIG_DIR / "leaf.csr.tmp", CONFIG_DIR / "leaf.ext.tmp"
+    try:
+        ext.write_text(f"subjectAltName={san}\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n"
+                       "keyUsage=critical,digitalSignature\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
+        openssl("req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                "-keyout", str(key), "-subj", "/CN=PhoneDrop", "-out", str(csr))
+        os.chmod(key, 0o600)
+        openssl("x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key), "-CAcreateserial",
+                "-days", str(days), "-extfile", str(ext), "-out", str(cert))
+    finally:
+        csr.unlink(missing_ok=True)
+        ext.unlink(missing_ok=True)
+    meta.write_text(json.dumps({"ips": want, "expires": time.time() + days * 86400, "ca": True}))
+    return cert, key, ca
 
 
 def cert_fingerprint(cert: Path) -> str:
@@ -1548,7 +1591,7 @@ def main():
     ips = lan_ips()
     ip = primary_ip()
     bind = args.bind or ip
-    cert, key = ensure_cert(ips)
+    cert, key, ca = ensure_cert(ips)
 
     hosts = {f"127.0.0.1:{args.local_port}", f"localhost:{args.local_port}",
              f"127.0.0.1:{args.port}", f"localhost:{args.port}",
@@ -1557,10 +1600,11 @@ def main():
     Handler.state = state
     Handler.allowed_hosts = hosts
     Handler.local_port = args.local_port
+    Handler.ca_der = ssl.PEM_cert_to_DER_cert(ca.read_text())
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(cert, key)
+    ctx.load_cert_chain(cert, key)  # leaf only: the root is the phone's trust anchor
 
     try:
         lan = TLSServer((bind, args.port), Handler, ctx)
@@ -1578,9 +1622,9 @@ def main():
     print(f"  Saving to:   {state.store}" + (f"  (deleted after {state.keep_days} day(s))" if state.keep_days else ""))
     print(f"  This PC:     http://127.0.0.1:{args.local_port}")
     print(f"  Phone:       https://{ip}:{args.port}   (same Wi-Fi)")
-    print(f"  Cert SHA-256 {cert_fingerprint(cert)}")
-    print("\n  Scan with your phone camera to pair (your browser will warn about the")
-    print("  self-signed certificate once — check the fingerprint above and continue):\n")
+    print(f"  Root CA SHA-256 {cert_fingerprint(ca)}")
+    print("\n  Scan with your phone camera to pair (until the root certificate is installed, your browser")
+    print("  warns about the certificate — check the root fingerprint above and continue):\n")
     print_qr(phone_url)
     print("  Keep this QR private: anyone who scans it can upload to and read from the panel"
           + ("." if state.no_confirm else " once you approve them."))
@@ -1589,6 +1633,8 @@ def main():
     if state.pair_until:
         print(f"  Pairing is open until {time.strftime('%H:%M', time.localtime(state.pair_until))}; "
               "restart PhoneDrop to pair another device later.")
+    print("  To stop the certificate warning for good, install the root certificate on the phone:")
+    print(f"  https://{ip}:{args.port}/ca.crt (see README)")
     print("  Run with --new-token to unpair every device.  Ctrl+C to stop.\n")
     if bind != "0.0.0.0" and not ipaddress.ip_address(bind).is_private:
         print(f"  WARNING: {bind} is not a private address. The phone port may be reachable from the internet.\n")

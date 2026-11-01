@@ -16,6 +16,20 @@
     <h1 id="pendingTitle">Waiting for approval on the computer…</h1>
     <p id="pendingName" class="pending-name"></p>
     <p id="pendingHint">Click <b>Allow</b> in the PhoneDrop panel on the computer. This page continues by itself.</p>
+    <details class="trust">
+      <summary>Tired of the certificate warning? Trust this computer</summary>
+      <p><a class="btn" href="/ca.crt" download>Download the root certificate</a></p>
+      <p><b>iPhone / iPad</b></p>
+      <ol>
+        <li>Open the downloaded profile: Settings → Profile Downloaded → Install.</li>
+        <li>Settings → General → About → Certificate Trust Settings → enable “PhoneDrop Root CA”.</li>
+      </ol>
+      <p><b>Android</b></p>
+      <ol>
+        <li>Settings → Security → Encryption &amp; credentials → Install a certificate → CA certificate.</li>
+        <li>Pick the downloaded file.</li>
+      </ol>
+    </details>
   </div>
 </body>
 </html>
