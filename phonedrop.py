@@ -655,6 +655,19 @@ class State:
             self._save_sessions()
         return rec
 
+    def remove_all_devices(self, keep_sid: str) -> int:
+        """Revoke every device, guest and pending request except the session `keep_sid` (this
+        computer's own, so the panel doesn't lock itself out). Unused guest links die with them."""
+        keep = self._h(keep_sid) if keep_sid else None
+        with self.lock:
+            gone = [k for k in self.sessions if k != keep]
+            for k in gone:
+                del self.sessions[k]
+            self.guest_tokens = {}
+            if gone:
+                self._save_sessions()
+        return len(gone)
+
     def pending_devices(self):
         self.prune_sessions()
         with self.lock:  # the sweeper thread may delete entries while we iterate
@@ -1552,6 +1565,10 @@ class Handler(BaseHTTPRequestHandler):
         st = self.state
         if method == "GET" and path == "/api/devices":
             return self.send_json({"devices": st.devices(self.cookie(SESSION_COOKIE))})
+        if method == "DELETE" and path == "/api/devices":  # everything except this computer's own session
+            n = st.remove_all_devices(self.cookie(SESSION_COOKIE))
+            self.log_message("revoked all devices (%d)", n)
+            return self.send_json({"revoked": n})
         m = re.fullmatch(r"/api/devices/([\w-]{1,32})(?:/(approve|deny))?", path)
         if not m:
             return self.error(404, "Not found", close=method != "GET")
