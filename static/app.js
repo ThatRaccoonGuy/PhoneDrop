@@ -56,6 +56,27 @@ async function api(path, opts = {}) {
   return r;
 }
 
+// In-page replacement for window.confirm(): resolves true only when the red button is pressed.
+// Cancel, the Escape key and a click outside all resolve false.
+let askResolve = null;
+function ask(text, action = 'Delete') {
+  const d = $('#confirm');
+  if (askResolve) askResolve(false); // a second question replaces the first
+  $('#confirmText').textContent = text;
+  $('#confirmYes').textContent = action;
+  if (!d.open) d.showModal();
+  $('#confirmYes').focus();
+  return new Promise((res) => { askResolve = res; });
+}
+
+function answer(value) {
+  const res = askResolve;
+  askResolve = null;
+  const d = $('#confirm');
+  if (d.open) d.close();
+  if (res) res(value);
+}
+
 function el(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -312,7 +333,7 @@ function updateSelbar() {
 
 async function deleteSelected() {
   const names = [...selected];
-  if (!names.length || !confirm(`Delete ${names.length} file${names.length > 1 ? 's' : ''}?`)) return;
+  if (!names.length || !(await ask(`Delete ${names.length} file${names.length > 1 ? 's' : ''}?`))) return;
   try {
     const r = await (await api('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ names }) })).json();
@@ -322,7 +343,7 @@ async function deleteSelected() {
 }
 
 async function remove(f) {
-  if (!f || !confirm(`Delete ${f.name}?`)) return;
+  if (!f || !(await ask(`Delete ${f.name}?`))) return;
   try {
     await api(`/api/files/${enc(f.name)}`, { method: 'DELETE' });
     toast('Deleted');
@@ -588,7 +609,7 @@ async function loadDevices() {
 
 // Cuts off every phone, guest and pending request in one go; this computer's own session stays.
 async function revokeAll() {
-  if (!confirm('Revoke every paired device, guest and pending request? This computer stays paired.')) return;
+  if (!(await ask('Revoke every paired device, guest and pending request? This computer stays paired.', 'Revoke all'))) return;
   try {
     const r = await (await api('/api/devices', { method: 'DELETE' })).json();
     toast(`Revoked ${r.revoked} device${r.revoked === 1 ? '' : 's'}`);
@@ -616,7 +637,7 @@ function deviceRow(d) {
 
 async function revoke(d) {
   const what = d.current ? 'this computer (you will need to pair this browser again)' : d.name;
-  if (!confirm(`Revoke ${what}?`)) return;
+  if (!(await ask(`Revoke ${what}?`, 'Revoke'))) return;
   try {
     await api(`/api/devices/${enc(d.id)}`, { method: 'DELETE' });
     if (d.current) return location.reload();
@@ -790,6 +811,12 @@ async function init() {
     e.preventDefault(); depth = 0; overlay.hidden = true;
     enqueue(e.dataTransfer.files);
   });
+
+  const confirmDlg = $('#confirm');
+  $('#confirmYes').onclick = () => answer(true);
+  $('#confirmNo').onclick = () => answer(false);
+  confirmDlg.addEventListener('cancel', (e) => { e.preventDefault(); answer(false); }); // Escape
+  confirmDlg.addEventListener('click', (e) => { if (e.target === confirmDlg) answer(false); }); // backdrop
 
   const viewer = $('#viewer');
   $('#viewerClose').onclick = () => viewer.close();
