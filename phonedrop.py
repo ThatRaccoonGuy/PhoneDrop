@@ -1373,6 +1373,11 @@ class Handler(BaseHTTPRequestHandler):
                 return uid
         return None
 
+    def log_error(self, fmt, *args):
+        if fmt.startswith("Request timed out"):
+            return  # an idle keep-alive connection reaching its limit is not an error
+        self.log_message(fmt, *args)
+
     def log_message(self, fmt, *args):
         msg = fmt % args
         # Pairing and guest links carry their secret in the query, whatever the parameter is called.
@@ -1467,16 +1472,37 @@ class Handler(BaseHTTPRequestHandler):
     # ---- dispatch
 
     def setup(self):
-        super().setup()
-        # Finish the TLS handshake now, under the header deadline, so the idle wait below only ever
-        # measures real idle time between requests (the handshake bytes would otherwise count as one).
-        if isinstance(self.connection, ssl.SSLSocket):
-            self.connection.settimeout(HEADER_TIMEOUT)
+        ctx = getattr(self.server, "ctx", None)
+        if ctx:  # the phone listener: wrap in TLS here, after a peek at the first byte
+            self.request.settimeout(HEADER_TIMEOUT)
             try:
-                self.connection.do_handshake()
-            except (OSError, ssl.SSLError):
-                self.close_connection = True
-                raise
+                first = self.request.recv(1, socket.MSG_PEEK)
+            except OSError:
+                first = b""
+            if first and first[0] != 0x16:  # not a TLS record: someone typed http:// on the https port
+                self._redirect_plain_http()
+                raise PlainHTTPOnTLS()
+            self.request = ctx.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
+            self.request.settimeout(HEADER_TIMEOUT)
+            # Finish the handshake now, under the header deadline, so the idle wait in
+            # handle_one_request only ever measures real idle time between requests.
+            self.request.do_handshake()
+        super().setup()
+
+    def _redirect_plain_http(self):
+        """Answer a plain-HTTP request on the HTTPS port with a redirect to https://, then close."""
+        try:
+            self.request.settimeout(5)
+            raw = self.request.recv(4096).decode("latin-1", "replace")
+            line = raw.split("\r\n", 1)[0].split(" ")
+            path = line[1] if len(line) >= 2 and line[1].startswith("/") and " " not in line[1] else "/"
+            host = next((h.split(":", 1)[1].strip().lower() for h in raw.split("\r\n") if h.lower().startswith("host:")), "")
+            base = f"https://{host}" if host in self.allowed_hosts else self.phone_base
+            resp = (f"HTTP/1.1 301 Moved Permanently\r\nLocation: {base}{path}\r\nConnection: close\r\n"
+                    "Content-Length: 0\r\n\r\n")
+            self.request.sendall(resp.encode("latin-1", "replace"))
+        except OSError:
+            pass
 
     def _wait_for_request(self) -> bool:
         """Block until the client starts sending a request, or give up after KEEPALIVE_IDLE seconds.
@@ -1995,6 +2021,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
 
+class PlainHTTPOnTLS(Exception):
+    """A plain http:// request arrived on the https listener; it was answered with a redirect."""
+
+
 class LimitedServer:
     """Mixin for both listeners: caps open connections in total and per client IP, so idle or slow
     clients can't pile up threads. A connection over the limit is closed straight away."""
@@ -2028,6 +2058,20 @@ class LimitedServer:
         finally:
             self._release(client_address[0])
 
+    def handle_error(self, request, client_address):
+        # Failed handshakes, dropped connections and http-on-https are routine; log one line, not a
+        # traceback (which also kept the real request log scrolling out of view).
+        exc = sys.exc_info()[1]
+        if isinstance(exc, PlainHTTPOnTLS):
+            sys.stderr.write(f"{time.strftime('%H:%M:%S')} {client_address[0]:<15} plain http on the https port, "
+                             "redirected to https://\n")
+            return
+        if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError, OSError)):
+            reason = getattr(exc, "reason", None) or exc.__class__.__name__
+            sys.stderr.write(f"{time.strftime('%H:%M:%S')} {client_address[0]:<15} connection dropped: {reason}\n")
+            return
+        super().handle_error(request, client_address)
+
     def _release(self, ip):
         with self.per_ip_lock:
             n = self.per_ip.get(ip, 0) - 1
@@ -2044,9 +2088,9 @@ class TLSServer(LimitedServer, ThreadingHTTPServer):
         super().__init__(addr, handler)
 
     def get_request(self):
-        sock, addr = self.socket.accept()
-        # Handshake happens lazily in the worker thread, so a stalled client can't block accept().
-        return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+        # The TLS wrap and handshake happen in the worker thread (Handler.setup), after a peek that
+        # tells plain-http visitors apart, so a stalled client can't block accept().
+        return self.socket.accept()
 
 
 class PlainServer(LimitedServer, ThreadingHTTPServer):
