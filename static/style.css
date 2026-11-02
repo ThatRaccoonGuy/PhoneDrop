@@ -36,7 +36,7 @@ button:disabled:hover { border-color: var(--line); background: var(--panel2); }
   backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; }
 .brand img { width: 28px; height: 28px; }
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 3px rgba(255,107,107,.15); }
 .dot.on { background: var(--good); box-shadow: 0 0 0 3px rgba(62,207,142,.15); }
 
@@ -178,6 +178,12 @@ body.locked .trust p { margin: 12px 0 4px; color: var(--text); font-size: 14px; 
 .pair-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .pair-actions > * { padding: 6px 12px; min-height: 34px; font-size: 14px; }
 
+dialog.confirm { width: min(400px, calc(100vw - 24px)); padding: 18px 18px 14px; color: var(--text); background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r); box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+dialog.confirm p { margin: 0 0 16px; font-size: 15px; line-height: 1.45; overflow-wrap: anywhere; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.confirm-actions .danger { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; }
+.confirm-actions .danger:hover { background: #ff5252; border-color: #ff5252; }
 dialog#devices { width: min(560px, calc(100vw - 24px)); max-height: min(80dvh, 640px); padding: 0; color: var(--text);
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); box-shadow: 0 8px 30px rgba(0,0,0,.5); }
 .devices-top { display: flex; justify-content: space-between; align-items: center; padding: 10px 10px 10px 16px;
