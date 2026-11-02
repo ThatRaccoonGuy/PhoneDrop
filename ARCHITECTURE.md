@@ -48,6 +48,10 @@ Rules that hold everywhere:
   works after a restart.
 - File types are decided from content; only images, audio/video and PDF are ever served inline, and
   always under a sandboxing CSP. Everything else is a download.
+- Decoders (vips, ImageMagick, ffmpeg, poppler) never see an image whose header declares more than
+  `MAX_PIXELS`; ImageMagick runs under hard resource limits; with bubblewrap present every decoder runs
+  in a namespace with no network, no home, read-only input and one writable output directory
+  (`media_cmd()`). Video remuxing is capped to two at a time.
 
 ## Sessions (`sessions.json`)
 
