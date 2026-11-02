@@ -582,6 +582,18 @@ async function loadDevices() {
     list = (await (await api('/api/devices')).json()).devices;
   } catch (e) { return toast(e.message, true); }
   $('#deviceList').replaceChildren(...(list.length ? list.map(deviceRow) : [el('p', { class: 'muted' }, 'No devices.')]));
+  // Only worth showing when there is something besides this computer to revoke.
+  $('#revokeAll').hidden = !list.some((d) => !d.current);
+}
+
+// Cuts off every phone, guest and pending request in one go; this computer's own session stays.
+async function revokeAll() {
+  if (!confirm('Revoke every paired device, guest and pending request? This computer stays paired.')) return;
+  try {
+    const r = await (await api('/api/devices', { method: 'DELETE' })).json();
+    toast(`Revoked ${r.revoked} device${r.revoked === 1 ? '' : 's'}`);
+  } catch (e) { toast(e.message, true); }
+  loadDevices();
 }
 
 function deviceRow(d) {
@@ -717,6 +729,7 @@ async function init() {
     devBtn.hidden = false;
     devBtn.onclick = openDevices;
     $('#devicesClose').onclick = () => $('#devices').close();
+    $('#revokeAll').onclick = revokeAll;
     $('#devices').addEventListener('click', (e) => { if (e.target === $('#devices')) $('#devices').close(); });
     setupGuest();
     $('#hint').textContent = 'Drop files here, paste images or text with Ctrl+V, or send them from your phone.';
