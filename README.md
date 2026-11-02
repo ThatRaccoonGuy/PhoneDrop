@@ -141,8 +141,13 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   screenshot or stream) while the pairing window is open, and only approve requests you expect.
   Revoke a lost device under **Devices**, or run with `--new-token` to unpair everything.
   Guests (people you sent a guest link) are different: they can only upload, and only for a while.
-- **Files are processed by ImageMagick / libvips / ffmpeg** (previews, clipboard conversion, video
-  remuxing). Bugs in media decoders have been exploited before, so keep them updated. Only paired devices and guests
+- **Files are processed by ImageMagick / libvips / ffmpeg / poppler** (previews, clipboard conversion,
+  video remuxing). Bugs in media decoders have been exploited before, so keep them updated. PhoneDrop
+  limits the damage: images whose header declares more than 80 megapixels are never decoded,
+  ImageMagick runs with hard memory/time limits, and if `bwrap` (bubblewrap) is installed and
+  usable on your kernel, every decoder runs in a sandbox with no network, no home directory and a
+  read-only input. PhoneDrop tests the sandbox at startup and the startup text says whether it is
+  active. Only paired devices and guests
   you sent a link to can upload.
 - **Don't expose it to the internet**: no port forwarding, and don't use `--bind 0.0.0.0` on a
   machine with a public IP. It's built for a local network.
@@ -152,6 +157,50 @@ sudo ufw allow from 192.168.0.0/24 to any port 8443 proto tcp
   paired session like any device.
 - **Paired sessions last 30 days** and aren't tied to the device's IP. Anyone who copies the
   session cookie out of a paired browser gets the same access.
+
+## Security patch notes
+
+Two review rounds have been run against PhoneDrop so far: an independent code review (2026-11-01)
+and a red-team exercise with two attackers (2026-11-02) who tried to get in as an unpaired host on
+the Wi-Fi, a malicious web page, a guest, a revoked or still-pending phone, and another local user
+account. What they found, and what changed:
+
+**Red-team round (2026-11-02)**
+
+- *Medium* — A tiny PNG declaring 30000×30000 pixels made ImageMagick allocate ~7 GB when it was
+  used as the preview/clipboard fallback; reachable through a guest upload. **Fixed:** pixel budget
+  read from the file header before any decoder runs, ImageMagick resource limits, bubblewrap sandbox
+  around every decoder.
+- *Medium* — Video remuxing ran inside the upload request with a 10-minute ceiling, so a burst of
+  slow video uploads could pin the worker threads. **Fixed:** 120 s limit, at most two remuxes at a
+  time, 503 when busy.
+- *Low* — A `Range` header with thousands of digits crashed that request with a traceback.
+  **Fixed:** bounded parsing.
+- *Low* — The TLS certificate advertised the computer's hostname to anyone on the network.
+  **Fixed:** removed from the certificate; existing installs re-issue it automatically, phones keep
+  their trust.
+- *Hardening* — An absolute 20-second deadline for request headers (slow-header connections),
+  larger global cap on pending pairing requests.
+- *Review of the fixes* found two more: a sandbox that is installed but unusable would have failed
+  silently (now probed at startup, with an honest fallback), and lossless WebP escaped the pixel
+  budget (now parsed). Both fixed.
+- *Accepted* — Commit timestamps carry the author's UTC offset; a paired device remains trusted
+  within its connection caps.
+
+Tried and held: unauthenticated access to any file or API, path traversal variants, cookie forgery
+and reuse after revoke, guest/pending escalation, CSRF with and without `Origin`, DNS rebinding,
+script injection through notes, file names and device names, clickjacking, Range edge cases,
+long-poll floods. The git history contains no personal data.
+
+**Code review round (2026-11-01)**
+
+- *High* — The PC's session cookie could be captured by another local account listening on a
+  loopback port and replayed. **Fixed:** the PC side now requires the same Unix user.
+- *Medium* — Terminal escape injection via the request log; unbounded connection threads; memory
+  blow-ups on malformed images; root certificate without name constraints; leaf-only chain.
+  **All fixed** (see the Security section above).
+- *Low* — Pinned decoders, 0600 files, pending-request caps, redacted logs, disk reservation for
+  parallel uploads, expiring one-time PC code.
 
 ## License
 
