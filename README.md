@@ -187,6 +187,9 @@ account. What they found, and what changed:
 - *Accepted* — Commit timestamps carry the author's UTC offset; a paired device remains trusted
   within its connection caps.
 
+The detailed working notes (reproductions, memory figures, per-fix verification) were kept out of
+the repository on purpose; this section is the record.
+
 Tried and held: unauthenticated access to any file or API, path traversal variants, cookie forgery
 and reuse after revoke, guest/pending escalation, CSRF with and without `Origin`, DNS rebinding,
 script injection through notes, file names and device names, clickjacking, Range edge cases,
