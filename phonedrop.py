@@ -55,7 +55,10 @@ GUEST_LINK_TTL = 10 * 60  # an unused guest link stops working after this long
 GUEST_MINUTES = 30
 LOCAL_CODE_TTL = 120  # the PC's one-time pairing code (opened in its browser) stops working after this long
 PENDING_MAX_PER_IP = 3  # pairing requests waiting for approval, per IP and in total
-PENDING_MAX = 10
+PENDING_MAX = 20
+MAX_PIXELS = 80_000_000  # images above this (e.g. a 30000x30000 "bomb") get no preview or clipboard copy
+VIDEO_STRIP_TIMEOUT = 120  # seconds ffmpeg may spend remuxing one upload (it runs in the request thread)
+VIDEO_SLOTS = threading.BoundedSemaphore(2)  # concurrent ffmpeg remuxes; more wait, then get 503
 MAX_CONNECTIONS = 64  # open connections per listener; more are closed at once
 MAX_CONNECTIONS_PER_IP = 16  # browsers open about 6 per host, so this only stops floods
 HEADER_TIMEOUT = 20  # seconds a client may stay silent before its request headers are complete
@@ -187,24 +190,121 @@ def claimed_extension(name: str) -> str:
     return name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
 
+# ---------------------------------------------------------------- running decoders on untrusted files
+#
+# vips, ImageMagick, ffmpeg and poppler all parse attacker-controlled bytes. Every call goes through
+# media_cmd(): ImageMagick gets hard resource limits, and when bubblewrap is installed the decoder runs
+# in a throwaway namespace with no network, no home directory, the input read-only and only its output
+# directory writable. A bug in a decoder then yields a sandboxed process, not the user's files.
+
+MAGICK_LIMITS = {"MAGICK_AREA_LIMIT": "128MP", "MAGICK_MEMORY_LIMIT": "1GiB", "MAGICK_MAP_LIMIT": "2GiB",
+                 "MAGICK_DISK_LIMIT": "2GiB", "MAGICK_WIDTH_LIMIT": "20000", "MAGICK_HEIGHT_LIMIT": "20000",
+                 "MAGICK_TIME_LIMIT": "120"}
+SANDBOX = shutil.which("bwrap")
+
+
+def media_cmd(cmd: list, inputs: list, outdir: Path) -> list:
+    """Wrap a decoder command for media_env()/subprocess: sandboxed with bwrap when available."""
+    if not SANDBOX:
+        return cmd
+    wrap = [SANDBOX, "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--unshare-all", "--die-with-parent",
+            "--new-session", "--clearenv", "--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/tmp"]
+    for k, v in MAGICK_LIMITS.items():
+        wrap += ["--setenv", k, v]
+    for i in inputs:
+        wrap += ["--ro-bind", str(i), str(i)]
+    wrap += ["--bind", str(outdir), str(outdir), "--"]
+    return wrap + cmd
+
+
+def probe_sandbox():
+    """bwrap can be installed yet unusable (unprivileged user namespaces disabled). Try it once, and
+    fall back to unsandboxed decoders with the ImageMagick limits rather than failing every decode —
+    which would also silently leave video metadata in place."""
+    global SANDBOX
+    if not SANDBOX:
+        return
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)  # bwrap needs the bound directory to exist
+        ok = subprocess.run(media_cmd(["/usr/bin/true"], [], CONFIG_DIR), capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if not ok:
+        SANDBOX = None
+
+
+def media_env() -> dict:
+    """Environment for decoders run without bwrap: at least the ImageMagick limits apply."""
+    return {**os.environ, **MAGICK_LIMITS}
+
+
+def image_pixels(path: Path, ext: str):
+    """Width*height from the file header for the formats that declare it cheaply, else None.
+    Lets us refuse to decode a tiny file that would expand to gigabytes of pixels."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if ext == "png" and head[12:16] == b"IHDR":
+                return int.from_bytes(head[16:20], "big") * int.from_bytes(head[20:24], "big")
+            if ext == "gif":
+                return int.from_bytes(head[6:8], "little") * int.from_bytes(head[8:10], "little")
+            if ext == "bmp":
+                return abs(int.from_bytes(head[18:22], "little", signed=True)) * abs(int.from_bytes(head[22:26], "little", signed=True))
+            if ext == "webp" and head[12:16] == b"VP8X":
+                return (1 + int.from_bytes(head[24:27], "little")) * (1 + int.from_bytes(head[27:30], "little"))
+            if ext == "webp" and head[12:16] == b"VP8 ":
+                return (int.from_bytes(head[26:28], "little") & 0x3FFF) * (int.from_bytes(head[28:30], "little") & 0x3FFF)
+            if ext == "webp" and head[12:16] == b"VP8L":  # lossless: 14-bit width-1 and height-1 after the signature byte
+                bits = int.from_bytes(head[21:25], "little")
+                return ((bits & 0x3FFF) + 1) * (((bits >> 14) & 0x3FFF) + 1)
+            if ext == "jpg":
+                f.seek(2)
+                while True:
+                    marker = f.read(2)
+                    if len(marker) < 2 or marker[0] != 0xFF:
+                        return None
+                    if marker[1] in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        sof = f.read(7)
+                        return int.from_bytes(sof[3:5], "big") * int.from_bytes(sof[5:7], "big")
+                    if marker[1] == 0xDA:
+                        return None
+                    length = int.from_bytes(f.read(2), "big")
+                    if length < 2:
+                        return None
+                    f.seek(length - 2, 1)
+    except (OSError, IndexError, ValueError):
+        return None
+    return None
+
+
+def too_many_pixels(path: Path, ext: str) -> bool:
+    px = image_pixels(path, ext)
+    return px is not None and px > MAX_PIXELS
+
+
 def strip_video(path: Path, ext: str) -> bool:
     """Remux the video without its global metadata (GPS, device). Streams are copied, not re-encoded."""
     if ext not in ("mp4", "m4v", "mov", "3gp") or not shutil.which("ffmpeg"):
         return False
     fmt = {"mov": "mov", "3gp": "3gp"}.get(ext, "mp4")
-    tmp = path.with_name(path.name + ".strip")
+    outdir = path.parent / f".remux-{secrets.token_hex(6)}"  # only this directory is writable inside the sandbox
+    outdir.mkdir(mode=0o700)
+    tmp = outdir / "out"
     try:
-        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-protocol_whitelist", "file", "-i", str(path), "-map", "0", "-map_metadata", "-1",
-                            "-c", "copy", "-movflags", "+faststart", "-f", fmt, str(tmp)],
-                           capture_output=True, timeout=600)
+        cmd = ["ffmpeg", "-v", "error", "-y", "-protocol_whitelist", "file", "-i", str(path), "-map", "0",
+               "-map_metadata", "-1", "-c", "copy", "-movflags", "+faststart", "-f", fmt, str(tmp)]
+        r = subprocess.run(media_cmd(cmd, [path], outdir), capture_output=True, timeout=VIDEO_STRIP_TIMEOUT,
+                           env=media_env())
         if r.returncode or not tmp.exists() or not tmp.stat().st_size:
-            tmp.unlink(missing_ok=True)
             return False
         os.replace(tmp, path)
         return True
     except subprocess.TimeoutExpired:
-        tmp.unlink(missing_ok=True)
         return False
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- metadata stripping
@@ -849,6 +949,8 @@ class State:
             cmds = []
             ext = p.suffix[1:].lower()
             kind = kind_of(ext)
+            if kind == "image" and too_many_pixels(p, ext):
+                return None  # a "decompression bomb": store it, but never decode it
             if kind == "video" and shutil.which("ffmpeg"):
                 # A frame from one second in (or the first frame for very short clips).
                 for ss in ("1", "0"):
@@ -872,7 +974,8 @@ class State:
             try:
                 for cmd in cmds:
                     try:
-                        r = subprocess.run(cmd, capture_output=True, timeout=60)
+                        r = subprocess.run(media_cmd(cmd, [p], self.thumbs), capture_output=True, timeout=60,
+                                           env=media_env())
                     except subprocess.TimeoutExpired:
                         continue
                     if r.returncode == 0 and tmp.exists() and tmp.stat().st_size:
@@ -1037,12 +1140,15 @@ class Clipper:
 
     def convert(self, src: Path, out: Path) -> bool:
         tmp = self.dir / f".{secrets.token_hex(6)}.png"
+        if too_many_pixels(src, src.suffix[1:].lower()):
+            return False  # never decode a "decompression bomb"
         try:
             if shutil.which("vips") and self._vips(src, tmp):
                 pass
             elif shutil.which("magick"):
-                r = subprocess.run(["magick", f"{CODER[src.suffix[1:].lower()]}:{src}[0]", "-auto-orient", "-define", "png:compression-level=1",
-                                    f"png:{tmp}"], capture_output=True, timeout=180)
+                cmd = ["magick", f"{CODER[src.suffix[1:].lower()]}:{src}[0]", "-auto-orient", "-define",
+                       "png:compression-level=1", f"png:{tmp}"]
+                r = subprocess.run(media_cmd(cmd, [src], self.dir), capture_output=True, timeout=180, env=media_env())
                 if r.returncode:
                     return False
             else:
@@ -1058,8 +1164,9 @@ class Clipper:
 
     def _vips(self, src: Path, tmp: Path) -> bool:
         # --vips-progress reports two phases: decoding the source (fast), then encoding the PNG.
-        proc = subprocess.Popen(["vips", "--vips-progress", "autorot", str(src), f"{tmp}[compression=1]"],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        cmd = ["vips", "--vips-progress", "autorot", str(src), f"{tmp}[compression=1]"]
+        proc = subprocess.Popen(media_cmd(cmd, [src], self.dir), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env=media_env())
         deadline = time.time() + 180
         buf = b""
         try:
@@ -1356,14 +1463,27 @@ class Handler(BaseHTTPRequestHandler):
     # ---- dispatch
 
     def handle_one_request(self):
-        self.connection.settimeout(HEADER_TIMEOUT)  # until parse_request() has the headers
+        self.connection.settimeout(HEADER_TIMEOUT)  # per read, until parse_request() has the headers
+        # ...and an absolute deadline: a client trickling one byte per read must not hold a thread.
+        self._watchdog = threading.Timer(HEADER_TIMEOUT, self._drop_connection)
+        self._watchdog.daemon = True
+        self._watchdog.start()
         try:
             super().handle_one_request()
-        except (ConnectionError, ssl.SSLError, TimeoutError):
+        except (ConnectionError, ssl.SSLError, TimeoutError, OSError):
             self.close_connection = True
+        finally:
+            self._watchdog.cancel()
+
+    def _drop_connection(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def parse_request(self):
         ok = super().parse_request()
+        self._watchdog.cancel()
         self.connection.settimeout(BODY_TIMEOUT)
         return ok
 
@@ -1606,7 +1726,7 @@ class Handler(BaseHTTPRequestHandler):
         csp = "default-src 'none'" if kind == "pdf" else FILE_CSP
         start, end = 0, size - 1
         status = 200
-        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        m = re.fullmatch(r"bytes=(\d{0,18})-(\d{0,18})", self.headers.get("Range", ""))  # longer: served whole
         if m and size and (m.group(1) or m.group(2)):
             if m.group(1):
                 start = int(m.group(1))
@@ -1702,7 +1822,15 @@ class Handler(BaseHTTPRequestHandler):
                         tmp.unlink(missing_ok=True)
                         return self.error(415, "The image file is malformed")
                 elif kind == "video":
-                    stripped = strip_video(tmp, ext)
+                    # ffmpeg runs in this request's thread; only a couple at a time, so a burst of
+                    # video uploads can't tie up every worker.
+                    if not VIDEO_SLOTS.acquire(timeout=30):
+                        tmp.unlink(missing_ok=True)
+                        return self.error(503, "Busy processing other videos, try again in a moment", close=True)
+                    try:
+                        stripped = strip_video(tmp, ext)
+                    finally:
+                        VIDEO_SLOTS.release()
             if stripped:
                 length = tmp.stat().st_size
             stem = safe_stem(orig, kind)
@@ -1900,6 +2028,7 @@ def openssl(*args):
 
 
 CA_VERSION = 2  # 2: the root carries name constraints (cert.json "ca"); older roots are replaced
+LEAF_VERSION = 2  # 2: no hostname in the SAN (cert.json "leaf"); older leaves are re-issued, the root stays
 # The only addresses and names the root may vouch for: private, CGNAT, link-local and loopback IPs,
 # and *.local / localhost. A leaked root key then can't be used to impersonate any public site.
 CA_PERMITTED_NETS = [ipaddress.ip_network(n) for n in (
@@ -1958,8 +2087,8 @@ def _ensure_leaf(cert, key, meta, want, ca, ca_key):
         ["openssl", "verify", "-CAfile", str(ca), str(cert)], capture_output=True).returncode == 0
     try:
         info = json.loads(meta.read_text())
-        if (signed and info.get("ca") == CA_VERSION and set(want) <= set(info["ips"])
-                and info["expires"] > time.time() + 7 * 86400):
+        if (signed and info.get("ca") == CA_VERSION and info.get("leaf") == LEAF_VERSION
+                and set(want) <= set(info["ips"]) and info["expires"] > time.time() + 7 * 86400):
             return cert, key
         migrate = info.get("ca") != CA_VERSION or not signed
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -1972,8 +2101,8 @@ def _ensure_leaf(cert, key, meta, want, ca, ca_key):
     covered = [ip for ip in want if any(ipaddress.ip_address(ip) in n for n in CA_PERMITTED_NETS)]
     for ip in sorted(set(want) - set(covered)):
         print(f"  WARNING: {ip} is not a private address, so the certificate can't cover it. The phone must use "
-              f"one of: {', '.join(covered)} or {socket.gethostname()}.local")
-    san = ",".join([f"IP:{ip}" for ip in covered] + ["DNS:localhost", f"DNS:{socket.gethostname()}.local"])
+              f"one of: {', '.join(covered)}")
+    san = ",".join([f"IP:{ip}" for ip in covered] + ["DNS:localhost"])  # no hostname: it would name the owner to the LAN
     days = 825  # Apple's maximum for TLS server certificates
     csr, ext = CONFIG_DIR / "leaf.csr.tmp", CONFIG_DIR / "leaf.ext.tmp"
     try:
@@ -1987,7 +2116,7 @@ def _ensure_leaf(cert, key, meta, want, ca, ca_key):
     finally:
         csr.unlink(missing_ok=True)
         ext.unlink(missing_ok=True)
-    meta.write_text(json.dumps({"ips": want, "expires": time.time() + days * 86400, "ca": CA_VERSION}))
+    meta.write_text(json.dumps({"ips": want, "expires": time.time() + days * 86400, "ca": CA_VERSION, "leaf": LEAF_VERSION}))
     return cert, key
 
 
@@ -2059,6 +2188,7 @@ def main():
     state = State(Path(args.dir).expanduser().resolve(), args.max_mb * 1024 * 1024, args.new_token,
                   args.pair_minutes, args.keep_metadata, max(0, args.keep_days), args.no_confirm,
                   max(1, args.guest_minutes))
+    probe_sandbox()  # after State(): the config directory it binds must exist
     threading.Thread(target=state.sessions_forever, daemon=True).start()
     if state.keep_days:
         threading.Thread(target=state.cleanup_forever, daemon=True).start()
@@ -2074,7 +2204,7 @@ def main():
 
     hosts = {f"127.0.0.1:{args.local_port}", f"localhost:{args.local_port}",
              f"127.0.0.1:{args.port}", f"localhost:{args.port}",
-             f"{socket.gethostname().lower()}.local:{args.port}"}
+             }
     hosts |= {f"{a}:{args.port}" for a in ips}
     Handler.state = state
     Handler.allowed_hosts = hosts
@@ -2106,6 +2236,8 @@ def main():
     print(f"  Saving to:   {state.store}" + (f"  (deleted after {state.keep_days} day(s))" if state.keep_days else ""))
     print(f"  This PC:     http://127.0.0.1:{args.local_port}")
     print(f"  Phone:       https://{ip}:{args.port}   (same Wi-Fi)")
+    print("  Decoders:    " + ("sandboxed with bubblewrap" if SANDBOX else
+                              "NOT sandboxed (install bubblewrap to isolate image/video decoders)"))
     print(f"  Root CA SHA-256 {cert_fingerprint(ca)}   <- compare this one on the phone")
     print(f"  Cert SHA-256    {cert_fingerprint(cert)}")
     print("\n  Scan with your phone camera to pair (until the root certificate is installed, your browser")
