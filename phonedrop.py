@@ -24,6 +24,7 @@ import json
 import os
 import re
 import secrets
+import select
 import shutil
 import socket
 import ssl
@@ -62,6 +63,7 @@ VIDEO_SLOTS = threading.BoundedSemaphore(2)  # concurrent ffmpeg remuxes; more w
 MAX_CONNECTIONS = 64  # open connections per listener; more are closed at once
 MAX_CONNECTIONS_PER_IP = 16  # browsers open about 6 per host, so this only stops floods
 HEADER_TIMEOUT = 20  # seconds a client may stay silent before its request headers are complete
+KEEPALIVE_IDLE = 75  # seconds a kept-alive connection may sit idle between requests (browsers pre-open sockets)
 BODY_TIMEOUT = 60  # seconds a client may stay silent while sending a body
 DISK_RESERVE = 256 * 1024 * 1024  # free space always left on the disk
 
@@ -1464,7 +1466,35 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- dispatch
 
+    def setup(self):
+        super().setup()
+        # Finish the TLS handshake now, under the header deadline, so the idle wait below only ever
+        # measures real idle time between requests (the handshake bytes would otherwise count as one).
+        if isinstance(self.connection, ssl.SSLSocket):
+            self.connection.settimeout(HEADER_TIMEOUT)
+            try:
+                self.connection.do_handshake()
+            except (OSError, ssl.SSLError):
+                self.close_connection = True
+                raise
+
+    def _wait_for_request(self) -> bool:
+        """Block until the client starts sending a request, or give up after KEEPALIVE_IDLE seconds.
+        Browsers open connections ahead of time and reuse them later; cutting those at the 20 s
+        header deadline made Safari report a lost connection, so idle time is counted separately."""
+        conn = self.connection
+        if isinstance(conn, ssl.SSLSocket) and conn.pending():
+            return True
+        try:
+            readable, _, _ = select.select([conn], [], [], KEEPALIVE_IDLE)
+        except (OSError, ValueError):
+            return False
+        return bool(readable)
+
     def handle_one_request(self):
+        if not self._wait_for_request():
+            self.close_connection = True
+            return
         self.connection.settimeout(HEADER_TIMEOUT)  # per read, until parse_request() has the headers
         # ...and an absolute deadline: a client trickling one byte per read must not hold a thread.
         self._watchdog = threading.Timer(HEADER_TIMEOUT, self._drop_connection)
