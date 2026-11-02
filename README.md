@@ -40,7 +40,8 @@ when the computer's IP address changes.
   click it to copy the digest.
 - **Text and links**: paste into the box on either device and it appears on the other with
   **Copy** and **Open**. On the computer, Ctrl+V anywhere on the page sends the clipboard text.
-- **Devices** (header, computer only) lists every paired device and lets you revoke them one by one.
+- **Devices** (header, computer only) lists every paired device and lets you revoke them one by
+  one, or all at once with **Revoke all devices** (this computer stays paired).
 - **Guest link** (header, computer only) lets someone who isn't paired send you files: click
   **Create link** and let them scan the QR (or send them the link). It works once, within
   10 minutes, and gives a page that can only upload, for 30 minutes (`--guest-minutes`). Their
