@@ -183,7 +183,7 @@ dialog#devices { width: min(560px, calc(100vw - 24px)); max-height: min(80dvh, 6
 .devices-top { display: flex; justify-content: space-between; align-items: center; padding: 10px 10px 10px 16px;
   border-bottom: 1px solid var(--line); }
 .device-list { display: grid; padding: 4px 16px 12px; }
-.devices-foot { display: flex; justify-content: flex-end; padding: 0 16px 14px; }
+.devices-actions { display: flex; gap: 8px; align-items: center; }
 .device { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0;
   border-bottom: 1px solid var(--line); }
 .device:last-child { border-bottom: 0; }

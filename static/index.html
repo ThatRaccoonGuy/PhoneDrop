@@ -85,12 +85,12 @@
 <dialog id="devices">
   <div class="devices-top">
     <h2>Devices</h2>
-    <button id="devicesClose" class="ghost" aria-label="Close">✕</button>
+    <div class="devices-actions">
+      <button id="revokeAll" class="danger" hidden>Revoke all</button>
+      <button id="devicesClose" class="ghost" aria-label="Close">✕</button>
+    </div>
   </div>
   <div id="deviceList" class="device-list"></div>
-  <div class="devices-foot">
-    <button id="revokeAll" class="danger" hidden>Revoke all devices</button>
-  </div>
 </dialog>
 
 <dialog id="guest">
