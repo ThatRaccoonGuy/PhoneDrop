@@ -1411,7 +1411,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_ca(self):
         self.send_common(200, "application/x-x509-ca-cert", len(self.ca_der),
-                         {"Content-Disposition": 'attachment; filename="PhoneDrop-Root-CA.crt"',
+                         # "inline": with "attachment" iOS Safari saves the file to Files instead of offering
+                         # the profile install prompt. Android treats both the same.
+                         {"Content-Disposition": 'inline; filename="PhoneDrop-Root-CA.crt"',
                           "Cache-Control": "no-store"}, csp=FILE_CSP)
         self.wfile.write(self.ca_der)
 
